@@ -38,6 +38,13 @@ enum FileTransferStatus {
 }
 
 pub async fn discover(discovery_port: u16, timeout_ms: u64) -> Result<()> {
+    let ifaces = discovery::get_interface_summary();
+    println!("scanning interfaces:");
+    for iface in &ifaces {
+        println!("  {iface}");
+    }
+    println!();
+
     let hosts = discovery::discover_hosts(discovery_port, timeout_ms).await?;
     if hosts.is_empty() {
         println!("no receivers found");
@@ -59,6 +66,101 @@ pub async fn discover(discovery_port: u16, timeout_ms: u64) -> Result<()> {
             },
             host.reply.device.protocol_version
         );
+    }
+    Ok(())
+}
+
+pub async fn connect_interactive(
+    direct_target: Option<String>,
+    discovery_port: u16,
+    timeout_ms: u64,
+    port: u16,
+) -> Result<()> {
+    if let Some(target) = direct_target {
+        connect_and_list_destinations(&target, port).await?;
+        return Ok(());
+    }
+
+    println!("scanning all network interfaces for receivers...");
+    let hosts = discovery::discover_hosts(discovery_port, timeout_ms).await?;
+    if hosts.is_empty() {
+        println!("no receivers found");
+        return Ok(());
+    }
+
+    if hosts.len() == 1 {
+        let host = &hosts[0];
+        println!("found single receiver, connecting...");
+        connect_and_list_destinations(&host.ip, host.reply.control_port).await?;
+        return Ok(());
+    }
+
+    println!("\nfound {} receivers:\n", hosts.len());
+    for (i, host) in hosts.iter().enumerate() {
+        println!(
+            "  {:>2}. {} {}:{} | {} {} | auth:{}",
+            i + 1,
+            host.reply.host,
+            host.ip,
+            host.reply.control_port,
+            host.reply.device.os,
+            host.reply.device.arch,
+            if host.reply.auth_required {
+                "required"
+            } else {
+                "off"
+            },
+        );
+    }
+
+    let (stream, device) = loop {
+        print!("\nselect receiver (1-{}) or 0 to quit: ", hosts.len());
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let choice: usize = match input.trim().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if choice == 0 {
+            println!("cancelled");
+            return Ok(());
+        }
+        if choice >= 1 && choice <= hosts.len() {
+            let host = &hosts[choice - 1];
+            break connect_and_handshake(&host.ip, host.reply.control_port).await?;
+        }
+    };
+
+    println!(
+        "\nconnected to {} | {} {} | protocol {}",
+        device.host_name, device.os, device.arch, device.protocol_version
+    );
+    drop(stream);
+    Ok(())
+}
+
+async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
+    let (mut stream, device) = connect_and_handshake(target, port).await?;
+    println!(
+        "connected to {} | {} {} | protocol {}",
+        device.host_name, device.os, device.arch, device.protocol_version
+    );
+    send_control(&mut stream, &ControlMessage::ListDestinations).await?;
+    let reply = read_control(&mut stream).await?;
+
+    match reply {
+        ControlMessage::Destinations { items } => {
+            for item in items {
+                let writable = if item.read_only { "ro" } else { "rw" };
+                println!(
+                    "{} | free {} bytes | {}",
+                    item.path, item.available_bytes, writable
+                );
+            }
+        }
+        ControlMessage::Error { message } => bail!("{message}"),
+        other => bail!("unexpected server response: {other:?}"),
     }
     Ok(())
 }

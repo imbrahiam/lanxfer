@@ -16,3 +16,4 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-
 uuid = { version = "1.18", features = ["v4"] }
 walkdir = "2.5"
 filetime = "0.2"
+if-addrs = "0.15.0"

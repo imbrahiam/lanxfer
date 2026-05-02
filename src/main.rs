@@ -28,6 +28,14 @@ async fn main() -> Result<()> {
         } => {
             client::discover(discovery_port, timeout_ms).await?;
         }
+        Command::Connect {
+            target,
+            discovery_port,
+            timeout_ms,
+            port,
+        } => {
+            client::connect_interactive(target, discovery_port, timeout_ms, port).await?;
+        }
         Command::Destinations { target, port } => {
             client::print_destinations(&target, port).await?;
         }

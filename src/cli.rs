@@ -25,12 +25,23 @@ pub enum Command {
         #[arg(long)]
         pairing_code: Option<String>,
     },
-    /// Discover receivers in local network.
+    /// Discover receivers across all network interfaces.
     Discover {
         #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
         discovery_port: u16,
         #[arg(long, default_value_t = 1500)]
         timeout_ms: u64,
+    },
+    /// Discover and interact with a receiver (interactive or direct).
+    Connect {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
+        discovery_port: u16,
+        #[arg(long, default_value_t = 1500)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
+        port: u16,
     },
     /// List destination drives/paths exposed by a receiver.
     Destinations {
