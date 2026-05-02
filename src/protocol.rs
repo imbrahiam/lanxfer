@@ -24,6 +24,14 @@ pub struct DestinationInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrepareStatus {
     Ready,
@@ -97,6 +105,15 @@ pub enum ControlMessage {
         final_hash: String,
         bytes_received: u64,
         error: Option<String>,
+    },
+    BrowseDirectory {
+        destination_path: String,
+        relative_path: String,
+        auth_code: Option<String>,
+    },
+    DirectoryContents {
+        relative_path: String,
+        entries: Vec<DirEntry>,
     },
     Error {
         message: String,

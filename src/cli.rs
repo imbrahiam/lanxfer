@@ -11,11 +11,20 @@ use crate::protocol::{DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT};
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Launch interactive transfer session.
+    Interactive {
+        #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
+        discovery_port: u16,
+        #[arg(long, default_value_t = 1500)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
+        port: u16,
+    },
     /// Run receiver server on this machine.
     Serve {
         #[arg(long, default_value = "0.0.0.0:44818")]

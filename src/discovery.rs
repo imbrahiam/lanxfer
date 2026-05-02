@@ -92,7 +92,10 @@ pub fn get_interface_summary() -> Vec<String> {
                     if iface.is_loopback() {
                         lines.push(format!("  {} ({}/{} loopback)", iface.name, ip, cidr));
                     } else {
-                        lines.push(format!("  {} ({}/{}, broadcast {})", iface.name, ip, cidr, bcast));
+                        lines.push(format!(
+                            "  {} ({}/{}, broadcast {})",
+                            iface.name, ip, cidr, bcast
+                        ));
                     }
                 }
             }
@@ -151,6 +154,69 @@ pub async fn discover_hosts(discovery_port: u16, timeout_ms: u64) -> Result<Vec<
         let _ = socket.send_to(magic_bytes, target).await;
     }
 
+    collect_replies(&socket, timeout_ms).await
+}
+
+pub async fn discover_hosts_with_fallback(
+    discovery_port: u16,
+    timeout_ms: u64,
+) -> Result<Vec<DiscoveredHost>> {
+    let hosts = discover_hosts(discovery_port, timeout_ms).await?;
+    if !hosts.is_empty() {
+        return Ok(hosts);
+    }
+
+    eprintln!("broadcast discovery found nothing, trying subnet scan...");
+    subnet_scan(discovery_port, timeout_ms).await
+}
+
+async fn subnet_scan(discovery_port: u16, timeout_ms: u64) -> Result<Vec<DiscoveredHost>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let magic_bytes = DISCOVER_MAGIC.as_bytes();
+
+    let ranges = get_subnet_ranges();
+    for (ip, cidr) in &ranges {
+        let effective_cidr = (*cidr).max(24);
+        let ip_bits = u32::from(*ip);
+        let mask = if effective_cidr == 0 {
+            0u32
+        } else {
+            !0u32 << (32 - effective_cidr)
+        };
+        let network = ip_bits & mask;
+        let host_count = 1u32 << (32 - effective_cidr);
+
+        for i in 1..host_count.saturating_sub(1) {
+            let target_ip = Ipv4Addr::from(network | i);
+            if target_ip == *ip {
+                continue;
+            }
+            let addr = SocketAddrV4::new(target_ip, discovery_port);
+            let _ = socket.send_to(magic_bytes, addr).await;
+        }
+    }
+
+    collect_replies(&socket, timeout_ms).await
+}
+
+fn get_subnet_ranges() -> Vec<(Ipv4Addr, u8)> {
+    let mut ranges = Vec::new();
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for iface in interfaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            if let if_addrs::IfAddr::V4(ref v4) = iface.addr {
+                let mask = u32::from(v4.netmask);
+                let cidr = mask.leading_ones() as u8;
+                ranges.push((v4.ip, cidr));
+            }
+        }
+    }
+    ranges
+}
+
+async fn collect_replies(socket: &UdpSocket, timeout_ms: u64) -> Result<Vec<DiscoveredHost>> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut buf = [0u8; 8192];
     let mut out = Vec::new();
