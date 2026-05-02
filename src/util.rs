@@ -5,6 +5,25 @@ use tokio::task;
 
 use crate::protocol::{DeviceInfo, PROTOCOL_VERSION};
 
+pub fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
+
+    if bytes >= TB {
+        format!("{:.1} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 pub fn host_name() -> String {
     hostname::get()
         .ok()
@@ -66,7 +85,7 @@ fn hash_file_blocking(path: &PathBuf, limit: Option<u64>) -> Result<String> {
 
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
     let mut remaining = limit.unwrap_or(u64::MAX);
 
     while remaining > 0 {

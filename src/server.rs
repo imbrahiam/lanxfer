@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use std::cmp;
 use std::path::Path;
 use tokio::fs::{self, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::discovery;
@@ -50,12 +50,35 @@ pub async fn run_server(
     }
 }
 
+fn tune_socket(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let buf_size: libc::c_int = 4 * 1024 * 1024;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 async fn handle_client(
     mut stream: TcpStream,
     server_device: crate::protocol::DeviceInfo,
     pairing_code: String,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
+    tune_socket(&stream);
 
     let first = read_control(&mut stream).await?;
     match first {
@@ -104,6 +127,74 @@ async fn handle_client(
             ControlMessage::ListDestinations => {
                 let items = storage::list_destinations();
                 send_control(&mut stream, &ControlMessage::Destinations { items }).await?;
+            }
+            ControlMessage::BrowseDirectory {
+                destination_path,
+                relative_path,
+                auth_code,
+            } => {
+                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code) {
+                    send_control(
+                        &mut stream,
+                        &ControlMessage::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                let root = match storage::ensure_destination_root(&destination_path) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        send_control(
+                            &mut stream,
+                            &ControlMessage::Error {
+                                message: err.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                let target = if relative_path.is_empty() {
+                    root
+                } else {
+                    let rel = match storage::sanitize_relative_path(&relative_path) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            send_control(
+                                &mut stream,
+                                &ControlMessage::Error {
+                                    message: err.to_string(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+                    root.join(rel)
+                };
+                let entries = match storage::list_directory(&target) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        send_control(
+                            &mut stream,
+                            &ControlMessage::Error {
+                                message: err.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                send_control(
+                    &mut stream,
+                    &ControlMessage::DirectoryContents {
+                        relative_path,
+                        entries,
+                    },
+                )
+                .await?;
             }
             ControlMessage::CreateDirectory {
                 destination_path,
@@ -419,7 +510,8 @@ async fn prepare_upload(
                 )),
             });
         }
-        if fs::metadata(&final_path).await?.len() == file_size {
+        // AlreadyExists check only if client provided a hash (non-streaming mode)
+        if !file_hash.is_empty() && fs::metadata(&final_path).await?.len() == file_size {
             let existing_hash = util::hash_file(&final_path).await?;
             if existing_hash == file_hash {
                 return Ok(ControlMessage::UploadReady {
@@ -487,9 +579,10 @@ async fn receive_transfer(
         .open(part_path)
         .await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut file = BufWriter::with_capacity(4 * 1024 * 1024, file);
 
     let mut remaining = file_size.saturating_sub(offset);
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
     while remaining > 0 {
         let to_read = cmp::min(remaining as usize, buf.len());
         stream
@@ -502,7 +595,13 @@ async fn receive_transfer(
     file.flush().await?;
 
     let final_hash = util::hash_file(part_path).await?;
-    let verified = final_hash == file_hash;
+    // If file_hash is empty (stream-hash mode), client will verify.
+    // Always finalize the file — client does the comparison.
+    let verified = if file_hash.is_empty() {
+        true // stream mode: server trusts transfer, client verifies hash
+    } else {
+        final_hash == file_hash
+    };
     if verified {
         if overwrite && final_path.exists() {
             let _ = fs::remove_file(final_path).await;

@@ -1,10 +1,10 @@
 use anyhow::{Result, anyhow, bail};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -17,17 +17,17 @@ use crate::protocol::{
 use crate::util;
 
 #[derive(Debug, Clone)]
-struct DirectoryEntry {
-    relative_path: String,
-    mtime_secs: i64,
+pub(crate) struct DirectoryEntry {
+    pub relative_path: String,
+    pub mtime_secs: i64,
 }
 
 #[derive(Debug, Clone)]
-struct FileEntry {
-    abs_path: PathBuf,
-    relative_path: String,
-    size: u64,
-    mtime_secs: i64,
+pub(crate) struct FileEntry {
+    pub abs_path: PathBuf,
+    pub relative_path: String,
+    pub size: u64,
+    pub mtime_secs: i64,
 }
 
 #[derive(Debug)]
@@ -35,6 +35,12 @@ enum FileTransferStatus {
     Transferred,
     AlreadyExists,
     Conflict,
+}
+
+pub(crate) struct ScanResult {
+    pub directories: Vec<DirectoryEntry>,
+    pub files: Vec<FileEntry>,
+    pub total_bytes: u64,
 }
 
 pub async fn discover(discovery_port: u16, timeout_ms: u64) -> Result<()> {
@@ -237,49 +243,29 @@ pub async fn send_path(
     let total_bytes = scan.total_bytes;
     let transferred_bytes = Arc::new(AtomicU64::new(0));
     let done_files = Arc::new(AtomicUsize::new(0));
-    let active_files = Arc::new(AtomicUsize::new(0));
-    let stop_reporter = Arc::new(AtomicBool::new(false));
 
-    let reporter = if show_progress && !dry_run {
-        let transferred = Arc::clone(&transferred_bytes);
-        let done = Arc::clone(&done_files);
-        let active = Arc::clone(&active_files);
-        let stop = Arc::clone(&stop_reporter);
-        let file_count = scan.files.len();
-        Some(tokio::spawn(async move {
-            let mut last = 0u64;
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let now = transferred.load(Ordering::Relaxed);
-                let delta = now.saturating_sub(last);
-                last = now;
-                let speed_mbps = (delta as f64 * 8.0) / 1_000_000.0;
-                let pct = if total_bytes == 0 {
-                    100.0
-                } else {
-                    (now as f64 / total_bytes as f64) * 100.0
-                };
-                println!(
-                    "progress {:.1}% | {}/{} bytes | {:.2} Mbps | files done {}/{} | active {}",
-                    pct,
-                    now,
-                    total_bytes,
-                    speed_mbps,
-                    done.load(Ordering::Relaxed),
-                    file_count,
-                    active.load(Ordering::Relaxed)
-                );
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
-        }))
+    let multi = if show_progress && !dry_run {
+        Some(MultiProgress::new())
     } else {
         None
     };
+    let overall_bar = multi.as_ref().map(|m| {
+        let bar = m.add(ProgressBar::new(total_bytes));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        bar.set_message(format!("0/{} files", scan.files.len()));
+        bar
+    });
 
     let semaphore = Arc::new(Semaphore::new(worker_count.max(1)));
     let mut set = JoinSet::new();
+    let file_count = scan.files.len();
     for entry in scan.files {
         let permit = semaphore.clone().acquire_owned().await?;
         let target = target.to_string();
@@ -287,11 +273,22 @@ pub async fn send_path(
         let auth_code = auth_code.map(ToString::to_string);
         let transferred = Arc::clone(&transferred_bytes);
         let done = Arc::clone(&done_files);
-        let active = Arc::clone(&active_files);
+        let file_bar = multi.as_ref().map(|m| {
+            let bar = m.add(ProgressBar::new(entry.size));
+            bar.set_style(
+                ProgressStyle::default_bar()
+                    .template("  {prefix:.dim} [{bar:30}] {bytes}/{total_bytes}")
+                    .unwrap()
+                    .progress_chars("#>-"),
+            );
+            bar.set_prefix(entry.relative_path.clone());
+            bar
+        });
+        let overall = overall_bar.clone();
+        let fc = file_count;
 
         set.spawn(async move {
             let _permit = permit;
-            active.fetch_add(1, Ordering::Relaxed);
             let result = transfer_one_file(
                 &target,
                 port,
@@ -301,10 +298,17 @@ pub async fn send_path(
                 dry_run,
                 &entry,
                 &transferred,
+                file_bar.as_ref(),
+                overall.as_ref(),
             )
             .await;
-            active.fetch_sub(1, Ordering::Relaxed);
             done.fetch_add(1, Ordering::Relaxed);
+            if let Some(fb) = &file_bar {
+                fb.finish_and_clear();
+            }
+            if let Some(ob) = &overall {
+                ob.set_message(format!("{}/{} files", done.load(Ordering::Relaxed), fc));
+            }
             result
         });
     }
@@ -323,9 +327,8 @@ pub async fn send_path(
         }
     }
 
-    stop_reporter.store(true, Ordering::Relaxed);
-    if let Some(task) = reporter {
-        let _ = task.await;
+    if let Some(ob) = &overall_bar {
+        ob.finish_with_message("done");
     }
 
     println!(
@@ -388,8 +391,10 @@ async fn transfer_one_file(
     dry_run: bool,
     file: &FileEntry,
     transferred_total: &Arc<AtomicU64>,
+    file_bar: Option<&ProgressBar>,
+    overall_bar: Option<&ProgressBar>,
 ) -> Result<FileTransferStatus> {
-    let source_hash = util::hash_file(&file.abs_path).await?;
+    // Stream-hash mode: no pre-hash, hash while sending (single disk read)
     let mut stream = connect_and_handshake(target, port).await?.0;
 
     send_control(
@@ -398,7 +403,7 @@ async fn transfer_one_file(
             destination_path: destination_path.to_string(),
             relative_path: file.relative_path.clone(),
             file_size: file.size,
-            file_hash: source_hash.clone(),
+            file_hash: String::new(), // empty = stream-hash mode
             mtime_secs: file.mtime_secs,
             overwrite,
             auth_code: auth_code.map(ToString::to_string),
@@ -432,6 +437,7 @@ async fn transfer_one_file(
         return Ok(FileTransferStatus::Transferred);
     }
 
+    // For resume: verify prefix hash if server has partial data
     if ready.offset > 0 {
         let local_prefix = util::hash_file_prefix_exact(&file.abs_path, ready.offset).await?;
         if ready.partial_hash.as_deref() != Some(local_prefix.as_str()) {
@@ -471,7 +477,7 @@ async fn transfer_one_file(
             relative_path: file.relative_path.clone(),
             offset: ready.offset,
             file_size: file.size,
-            file_hash: source_hash,
+            file_hash: String::new(), // computed after sending
             mtime_secs: file.mtime_secs,
             overwrite,
             auth_code: auth_code.map(ToString::to_string),
@@ -486,26 +492,39 @@ async fn transfer_one_file(
         other => bail!("unexpected begin response: {other:?}"),
     }
 
-    transmit_payload(
+    // Hash while sending — single disk read
+    let client_hash = transmit_payload(
         &mut stream,
         &file.abs_path,
         file.size,
         ready.offset,
         transferred_total,
+        file_bar,
+        overall_bar,
     )
     .await?;
 
     match read_control(&mut stream).await? {
         ControlMessage::TransferResult {
             verified,
+            final_hash,
             error,
-            bytes_received: _,
             ..
         } => {
-            if verified {
+            // Server computed its own hash — verify against ours
+            if verified && final_hash == client_hash {
+                Ok(FileTransferStatus::Transferred)
+            } else if !final_hash.is_empty() && final_hash == client_hash {
+                // Server didn't have pre-hash to compare but hashes match
                 Ok(FileTransferStatus::Transferred)
             } else {
-                bail!(error.unwrap_or_else(|| "hash verification failed".to_string()))
+                bail!(
+                    "{}",
+                    error.unwrap_or_else(|| format!(
+                        "hash mismatch: client={} server={}",
+                        client_hash, final_hash
+                    ))
+                )
             }
         }
         ControlMessage::Error { message } => bail!("{message}"),
@@ -519,13 +538,14 @@ struct UploadReady {
     partial_hash: Option<String>,
 }
 
-async fn connect_and_handshake(
+pub(crate) async fn connect_and_handshake(
     target: &str,
     port: u16,
 ) -> Result<(TcpStream, crate::protocol::DeviceInfo)> {
     let addr = format!("{target}:{port}");
     let mut stream = TcpStream::connect(&addr).await?;
     stream.set_nodelay(true)?;
+    tune_socket(&stream);
 
     send_control(
         &mut stream,
@@ -550,41 +570,67 @@ async fn connect_and_handshake(
     }
 }
 
+/// Transmit file data while computing BLAKE3 hash. Returns the full-file hash.
+/// Hashes the entire file (including any prefix before offset) for complete verification.
 async fn transmit_payload(
     stream: &mut TcpStream,
     source: &Path,
     file_size: u64,
     offset: u64,
     transferred_total: &Arc<AtomicU64>,
-) -> Result<()> {
-    let mut file = fs::File::open(source).await?;
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    file_bar: Option<&ProgressBar>,
+    overall_bar: Option<&ProgressBar>,
+) -> Result<String> {
+    let source = source.to_path_buf();
+    let file = fs::File::open(&source).await?;
+    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stream);
+    let mut hasher = blake3::Hasher::new();
+
+    if let Some(fb) = file_bar {
+        fb.set_position(offset);
+    }
+
+    // Read-and-hash prefix once to avoid a second full-file disk pass on resume.
+    let mut hashed_prefix = 0u64;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    while hashed_prefix < offset {
+        let remaining = (offset - hashed_prefix) as usize;
+        let cap = usize::min(remaining, buf.len());
+        let read = reader.read(&mut buf[..cap]).await?;
+        if read == 0 {
+            bail!("source file became shorter before resume offset");
+        }
+        hasher.update(&buf[..read]);
+        hashed_prefix += read as u64;
+    }
 
     let to_send = file_size.saturating_sub(offset);
     let mut sent = 0u64;
-    let mut buf = vec![0u8; 1024 * 1024];
     while sent < to_send {
         let remaining = (to_send - sent) as usize;
         let cap = usize::min(remaining, buf.len());
-        let read = file.read(&mut buf[..cap]).await?;
+        let read = reader.read(&mut buf[..cap]).await?;
         if read == 0 {
             bail!("source file became shorter during transfer");
         }
-        stream.write_all(&buf[..read]).await?;
+        hasher.update(&buf[..read]);
+        writer.write_all(&buf[..read]).await?;
         sent += read as u64;
         transferred_total.fetch_add(read as u64, Ordering::Relaxed);
+        if let Some(fb) = file_bar {
+            fb.inc(read as u64);
+        }
+        if let Some(ob) = overall_bar {
+            ob.inc(read as u64);
+        }
     }
-    stream.flush().await?;
-    Ok(())
+    writer.flush().await?;
+
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
-struct ScanResult {
-    directories: Vec<DirectoryEntry>,
-    files: Vec<FileEntry>,
-    total_bytes: u64,
-}
-
-async fn scan_source(source: &Path) -> Result<ScanResult> {
+pub(crate) async fn scan_source(source: &Path) -> Result<ScanResult> {
     let meta = fs::metadata(source).await?;
     let mut directories = Vec::new();
     let mut files = Vec::new();
@@ -670,6 +716,28 @@ fn path_to_slash_string(path: &Path) -> Result<String> {
         bail!("empty relative path");
     }
     Ok(out.join("/"))
+}
+
+fn tune_socket(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let buf_size: libc::c_int = 4 * 1024 * 1024; // 4 MB socket buffer
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 fn default_jobs(file_count: usize) -> usize {

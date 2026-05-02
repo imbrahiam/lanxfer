@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow, bail};
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use sysinfo::Disks;
 
-use crate::protocol::DestinationInfo;
+use crate::protocol::{DestinationInfo, DirEntry};
 
 pub fn list_destinations() -> Vec<DestinationInfo> {
     let mut destinations = Vec::new();
@@ -22,6 +23,36 @@ pub fn list_destinations() -> Vec<DestinationInfo> {
 
     destinations.sort_by(|a, b| a.path.cmp(&b.path));
     destinations
+}
+
+pub fn list_directory(path: &Path) -> Result<Vec<DirEntry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let mtime_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        entries.push(DirEntry {
+            name,
+            is_dir: metadata.is_dir(),
+            size: if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            },
+            mtime_secs,
+        });
+    }
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    Ok(entries)
 }
 
 pub fn sanitize_relative_path(input: &str) -> Result<PathBuf> {
