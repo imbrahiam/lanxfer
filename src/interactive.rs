@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
-use dialoguer::{Confirm, Input, MultiSelect, Select, theme::ColorfulTheme};
+use dialoguer::theme::ColorfulTheme;
+use dialoguer::{Confirm, Input, MultiSelect, Select};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,22 +14,144 @@ use crate::discovery;
 use crate::protocol::{
     ControlMessage, DestinationInfo, PROTOCOL_VERSION, read_control, send_control,
 };
+use crate::server;
+use crate::ui;
 use crate::util;
 
-pub async fn run_interactive(discovery_port: u16, timeout_ms: u64, port: u16) -> Result<()> {
-    let theme = ColorfulTheme::default();
+pub async fn run_peer_mode(discovery_port: u16, timeout_ms: u64, port: u16) -> Result<()> {
+    let theme = ui::theme();
+    ui::banner();
 
-    // Phase 1: Discovery + host selection
+    let device = util::local_device_info();
+    let pairing_code = util::generate_pairing_code();
+
+    ui::section("This device");
+    ui::kv("host", &device.host_name);
+    ui::kv("platform", &format!("{} {}", device.os, device.arch));
+    ui::kv("pairing code", &ui::yellow(&pairing_code));
+    ui::info("share this code with peers who want to send to you");
+
+    let bind = format!("0.0.0.0:{port}");
+    let server_code = pairing_code.clone();
+    tokio::spawn(async move {
+        if let Err(err) = server::run_server(bind, discovery_port, server_code, true).await {
+            ui::error(&format!("receiver crashed: {err:#}"));
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let local_ips = local_ipv4s();
+    let my_host = device.host_name.clone();
+
+    loop {
+        ui::section("Discover peers");
+        ui::info("scanning local network…");
+        let mut hosts = discovery::discover_hosts_with_fallback(discovery_port, timeout_ms).await?;
+        hosts.retain(|h| !local_ips.contains(&h.ip) && h.reply.host != my_host);
+
+        if hosts.is_empty() {
+            ui::warn("no other peers found yet");
+            ui::info("on another machine, run `lanxfer` — it will appear here");
+            let choices = vec!["Rescan", "Quit"];
+            let sel = Select::with_theme(&theme)
+                .with_prompt("Action")
+                .items(&choices)
+                .default(0)
+                .interact()?;
+            if sel == 1 {
+                return Ok(());
+            }
+            continue;
+        }
+
+        let mut items: Vec<String> = hosts
+            .iter()
+            .map(|h| {
+                let host_pad = format!("{:<20}", h.reply.host);
+                format!(
+                    "{}  {}",
+                    ui::bold(&host_pad),
+                    ui::dim(&format!(
+                        "{}:{}  {} {}",
+                        h.ip,
+                        h.reply.control_port,
+                        h.reply.device.os,
+                        h.reply.device.arch
+                    )),
+                )
+            })
+            .collect();
+        items.push(ui::dim("↻  Rescan"));
+        items.push(ui::dim("✗  Quit"));
+
+        let sel = Select::with_theme(&theme)
+            .with_prompt("Pick a peer to send to")
+            .items(&items)
+            .default(0)
+            .interact()?;
+
+        if sel == items.len() - 1 {
+            return Ok(());
+        }
+        if sel == items.len() - 2 {
+            continue;
+        }
+
+        let host = &hosts[sel];
+        let ip = host.ip.clone();
+        let control_port = host.reply.control_port;
+
+        ui::section("Connect");
+        let (remote, auth_code) = match connect_with_auth(&theme, &ip, control_port).await {
+            Ok(v) => v,
+            Err(err) => {
+                ui::error(&format!("{err:#}"));
+                continue;
+            }
+        };
+        ui::success(&format!(
+            "connected to {} ({} {})",
+            ui::bold(&remote.host_name),
+            remote.os,
+            remote.arch
+        ));
+
+        if let Err(err) = send_files_flow(&theme, &ip, control_port, auth_code.as_deref()).await {
+            ui::error(&format!("{err:#}"));
+        }
+    }
+}
+
+fn local_ipv4s() -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                ips.push(v4.ip.to_string());
+            }
+        }
+    }
+    ips
+}
+
+pub async fn run_interactive(discovery_port: u16, timeout_ms: u64, port: u16) -> Result<()> {
+    let theme = ui::theme();
+    ui::banner();
+
+    ui::section("Discover");
     let (ip, control_port) = select_host(&theme, discovery_port, timeout_ms, port).await?;
 
-    // Phase 2: Connect + auth
+    ui::section("Connect");
     let (device, auth_code) = connect_with_auth(&theme, &ip, control_port).await?;
-    println!(
-        "\nconnected to {} | {} {} | protocol {}\n",
-        device.host_name, device.os, device.arch, device.protocol_version
-    );
+    ui::success(&format!(
+        "connected to {} ({} {})",
+        ui::bold(&device.host_name),
+        device.os,
+        device.arch
+    ));
+    ui::kv("protocol", &device.protocol_version.to_string());
 
-    // Phase 3: Main menu loop
     main_menu_loop(&theme, &ip, control_port, auth_code.as_deref()).await
 }
 
@@ -38,11 +161,11 @@ async fn select_host(
     timeout_ms: u64,
     default_port: u16,
 ) -> Result<(String, u16)> {
-    println!("scanning for receivers...");
+    ui::info("scanning local network for receivers…");
     let hosts = discovery::discover_hosts_with_fallback(discovery_port, timeout_ms).await?;
 
     if hosts.is_empty() {
-        println!("no receivers found on network");
+        ui::warn("no receivers found on network");
         let ip: String = Input::with_theme(theme)
             .with_prompt("Enter receiver IP")
             .interact_text()?;
@@ -52,28 +175,32 @@ async fn select_host(
 
     if hosts.len() == 1 {
         let host = &hosts[0];
-        println!(
-            "found: {} ({}:{}) | {} {}",
-            host.reply.host,
-            host.ip,
-            host.reply.control_port,
-            host.reply.device.os,
-            host.reply.device.arch,
-        );
+        ui::success(&format!(
+            "found {} {}",
+            ui::bold(&host.reply.host),
+            ui::dim(&format!(
+                "({}:{}, {} {})",
+                host.ip, host.reply.control_port, host.reply.device.os, host.reply.device.arch
+            ))
+        ));
         return Ok((host.ip.clone(), host.reply.control_port));
     }
 
     let items: Vec<String> = hosts
         .iter()
         .map(|h| {
+            let host_pad = format!("{:<20}", h.reply.host);
             format!(
-                "{} ({}:{}) | {} {} | auth:{}",
-                h.reply.host,
-                h.ip,
-                h.reply.control_port,
-                h.reply.device.os,
-                h.reply.device.arch,
-                if h.reply.auth_required { "yes" } else { "no" },
+                "{}  {}",
+                ui::bold(&host_pad),
+                ui::dim(&format!(
+                    "{}:{}  {} {}  auth:{}",
+                    h.ip,
+                    h.reply.control_port,
+                    h.reply.device.os,
+                    h.reply.device.arch,
+                    if h.reply.auth_required { "yes" } else { "no" },
+                ))
             )
         })
         .collect();
@@ -149,9 +276,10 @@ async fn main_menu_loop(
     auth_code: Option<&str>,
 ) -> Result<()> {
     loop {
+        ui::section("Menu");
         let choices = vec!["Send files", "List remote drives", "Disconnect & exit"];
         let selection = Select::with_theme(theme)
-            .with_prompt("Main menu")
+            .with_prompt("What next?")
             .items(&choices)
             .default(0)
             .interact()?;
@@ -159,21 +287,20 @@ async fn main_menu_loop(
         match selection {
             0 => {
                 if let Err(err) = send_files_flow(theme, ip, port, auth_code).await {
-                    eprintln!("error: {err:#}");
+                    ui::error(&format!("{err:#}"));
                 }
             }
             1 => {
                 if let Err(err) = list_drives(ip, port).await {
-                    eprintln!("error: {err:#}");
+                    ui::error(&format!("{err:#}"));
                 }
             }
             2 => {
-                println!("disconnected");
+                ui::info("disconnected. bye.");
                 return Ok(());
             }
             _ => unreachable!(),
         }
-        println!();
     }
 }
 
@@ -183,15 +310,22 @@ async fn list_drives(ip: &str, port: u16) -> Result<()> {
 
     match read_control(&mut stream).await? {
         ControlMessage::Destinations { items } => {
-            println!();
+            ui::section("Remote drives");
+            println!(
+                "  {}  {}  {}",
+                ui::dim(&format!("{:<28}", "PATH")),
+                ui::dim(&format!("{:>10}", "FREE")),
+                ui::dim("MODE"),
+            );
             for item in &items {
-                let writable = if item.read_only { "ro" } else { "rw" };
-                println!(
-                    "  {} | {} free | {}",
-                    item.path,
-                    util::format_size(item.available_bytes),
-                    writable
-                );
+                let mode = if item.read_only {
+                    ui::dim("read-only")
+                } else {
+                    ui::ok("writable")
+                };
+                let path_pad = format!("{:<28}", item.path);
+                let free_pad = format!("{:>10}", util::format_size(item.available_bytes));
+                println!("  {}  {}  {}", ui::bold(&path_pad), free_pad, mode);
             }
             Ok(())
         }
@@ -217,18 +351,25 @@ async fn send_files_flow(
     port: u16,
     auth_code: Option<&str>,
 ) -> Result<()> {
-    // Step 1: Select destination drive
+    ui::section("Destination drive");
     let destinations = fetch_destinations(ip, port).await?;
     let writable: Vec<&DestinationInfo> = destinations.iter().filter(|d| !d.read_only).collect();
 
     if writable.is_empty() {
-        println!("no writable drives found on receiver");
+        ui::warn("no writable drives found on receiver");
         return Ok(());
     }
 
     let drive_items: Vec<String> = writable
         .iter()
-        .map(|d| format!("{} | {} free", d.path, util::format_size(d.available_bytes)))
+        .map(|d| {
+            let path_pad = format!("{:<28}", d.path);
+            format!(
+                "{}  {}",
+                ui::bold(&path_pad),
+                ui::dim(&format!("{} free", util::format_size(d.available_bytes)))
+            )
+        })
         .collect();
 
     let drive_idx = Select::with_theme(theme)
@@ -239,20 +380,20 @@ async fn send_files_flow(
 
     let dest_root = &writable[drive_idx].path;
 
-    // Step 2: Browse remote directory
+    ui::section("Destination folder");
     let remote_path = browse_remote_dir(theme, ip, port, dest_root, auth_code).await?;
 
-    // Step 3: Pick local files/folders
+    ui::section("Source files");
     let local_paths = pick_local_paths(theme)?;
     if local_paths.is_empty() {
-        println!("no files selected");
+        ui::info("no files selected");
         return Ok(());
     }
 
-    // Step 4: Confirm
-    println!("\nTransfer summary:");
+    ui::section("Confirm");
+    ui::kv("destination", &remote_path);
     for path in &local_paths {
-        println!("  {} -> {}", path.display(), remote_path);
+        ui::kv("source", &path.display().to_string());
     }
     let confirmed = Confirm::with_theme(theme)
         .with_prompt("Start transfer?")
@@ -260,17 +401,17 @@ async fn send_files_flow(
         .interact()?;
 
     if !confirmed {
-        println!("cancelled");
+        ui::info("cancelled");
         return Ok(());
     }
 
-    // Step 5: Transfer each selected path
+    ui::section("Transfer");
     for source in &local_paths {
-        println!("\ntransferring: {}", source.display());
+        ui::info(&format!("sending {}", ui::bold(&source.display().to_string())));
         transfer_with_progress(ip, port, source, &remote_path, auth_code).await?;
     }
 
-    println!("\nall transfers complete");
+    ui::success("all transfers complete");
     Ok(())
 }
 
@@ -302,31 +443,29 @@ async fn browse_remote_dir(
         };
         drop(stream);
 
-        // Build menu items
-        let display_path = if current_relative.is_empty() {
-            dest_root.to_string()
-        } else {
-            format!("{}/{}", dest_root, current_relative)
-        };
+        let display_path = format_remote_path(dest_root, &current_relative);
 
-        let mut items = vec![">> SELECT THIS FOLDER <<".to_string()];
+        let mut items = vec![ui::yellow("✓  Use this folder")];
         if !current_relative.is_empty() {
-            items.push(".. (go back)".to_string());
+            items.push(ui::dim("..  go up"));
         }
         for entry in &entries {
             if entry.is_dir {
-                items.push(format!("{}/", entry.name));
+                items.push(format!("{}/", ui::accent(&entry.name)));
             } else {
+                let name_pad = format!("{:<32}", entry.name);
                 items.push(format!(
-                    "  {} ({})",
-                    entry.name,
-                    util::format_size(entry.size)
+                    "{}  {}",
+                    name_pad,
+                    ui::dim(&util::format_size(entry.size))
                 ));
             }
         }
 
+        println!();
+        ui::kv("remote", &display_path);
         let selection = Select::with_theme(theme)
-            .with_prompt(&display_path)
+            .with_prompt("Navigate")
             .items(&items)
             .default(0)
             .interact()?;
@@ -361,39 +500,72 @@ async fn browse_remote_dir(
     if current_relative.is_empty() {
         Ok(dest_root.to_string())
     } else {
-        Ok(format!("{}/{}", dest_root, current_relative))
+        Ok(format_remote_path(dest_root, &current_relative))
     }
 }
 
+fn format_remote_path(root: &str, relative: &str) -> String {
+    if relative.is_empty() {
+        return root.to_string();
+    }
+    let mut base: PathBuf = PathBuf::from(root);
+    for part in relative.split('/').filter(|p| !p.is_empty()) {
+        base.push(part);
+    }
+    base.to_string_lossy().to_string()
+}
+
 fn pick_local_paths(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
-    // Choose starting location
     let cwd = std::env::current_dir()?;
     let home = dirs::home_dir().unwrap_or_else(|| cwd.clone());
     let desktop = home.join("Desktop");
+    let downloads = home.join("Downloads");
 
-    let mut start_options = vec![
-        format!("Current directory ({})", cwd.display()),
-        format!("Home ({})", home.display()),
-    ];
+    let mut start_options: Vec<(String, StartChoice)> = Vec::new();
+    start_options.push((
+        format!("Current directory  {}", ui::dim(&cwd.display().to_string())),
+        StartChoice::Path(cwd.clone()),
+    ));
+    start_options.push((
+        format!("Home               {}", ui::dim(&home.display().to_string())),
+        StartChoice::Path(home.clone()),
+    ));
     if desktop.is_dir() {
-        start_options.push(format!("Desktop ({})", desktop.display()));
+        start_options.push((
+            format!(
+                "Desktop            {}",
+                ui::dim(&desktop.display().to_string())
+            ),
+            StartChoice::Path(desktop.clone()),
+        ));
     }
-    start_options.push("Root (/)".to_string());
-    start_options.push("Enter path manually".to_string());
+    if downloads.is_dir() {
+        start_options.push((
+            format!(
+                "Downloads          {}",
+                ui::dim(&downloads.display().to_string())
+            ),
+            StartChoice::Path(downloads.clone()),
+        ));
+    }
+    if cfg!(windows) {
+        start_options.push(("Pick a drive (C:\\, D:\\, …)".to_string(), StartChoice::Drives));
+    } else {
+        start_options.push(("Root (/)".to_string(), StartChoice::Path(PathBuf::from("/"))));
+    }
+    start_options.push(("Enter path manually".to_string(), StartChoice::Manual));
 
+    let labels: Vec<String> = start_options.iter().map(|(s, _)| s.clone()).collect();
     let start_idx = Select::with_theme(theme)
         .with_prompt("Browse from")
-        .items(&start_options)
+        .items(&labels)
         .default(0)
         .interact()?;
 
-    let mut current_dir = match start_idx {
-        0 => cwd,
-        1 => home.clone(),
-        idx if desktop.is_dir() && idx == 2 => desktop,
-        idx if desktop.is_dir() && idx == 3 => PathBuf::from("/"),
-        idx if !desktop.is_dir() && idx == 2 => PathBuf::from("/"),
-        _ => {
+    let mut current_dir = match &start_options[start_idx].1 {
+        StartChoice::Path(p) => p.clone(),
+        StartChoice::Drives => pick_windows_drive(theme)?,
+        StartChoice::Manual => {
             let path: String = Input::with_theme(theme)
                 .with_prompt("Enter path")
                 .interact_text()?;
@@ -403,9 +575,23 @@ fn pick_local_paths(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
 
     loop {
         let mut entries: Vec<(String, PathBuf, bool, u64)> = Vec::new();
-        for entry in std::fs::read_dir(&current_dir)? {
+        let dir_iter = match std::fs::read_dir(&current_dir) {
+            Ok(it) => it,
+            Err(err) => {
+                ui::error(&format!("cannot read {}: {err}", current_dir.display()));
+                if let Some(parent) = current_dir.parent() {
+                    current_dir = parent.to_path_buf();
+                    continue;
+                }
+                return Ok(Vec::new());
+            }
+        };
+        for entry in dir_iter {
             let entry = entry?;
-            let meta = entry.metadata()?;
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') {
                 continue;
@@ -413,21 +599,24 @@ fn pick_local_paths(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
             let size = if meta.is_file() { meta.len() } else { 0 };
             entries.push((name, entry.path(), meta.is_dir(), size));
         }
-        entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        entries.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
 
-        let items: Vec<String> = std::iter::once(".. (go back)".to_string())
-            .chain(entries.iter().map(|(name, _, is_dir, size)| {
+        let items: Vec<String> = std::iter::once(ui::dim("..  go up")).chain(entries.iter().map(
+            |(name, _, is_dir, size)| {
                 if *is_dir {
-                    format!("{}/", name)
+                    format!("{}/", ui::accent(name))
                 } else {
-                    format!("{} ({})", name, util::format_size(*size))
+                    let name_pad = format!("{:<32}", name);
+                    format!("{}  {}", name_pad, ui::dim(&util::format_size(*size)))
                 }
-            }))
-            .collect();
+            },
+        ))
+        .collect();
 
-        println!("\nLocal: {}", current_dir.display());
+        println!();
+        ui::kv("local", &current_dir.display().to_string());
         let selections = MultiSelect::with_theme(theme)
-            .with_prompt("Select files/folders (space=toggle, enter=confirm)")
+            .with_prompt("Select files/folders  ·  space=toggle  enter=confirm")
             .items(&items)
             .interact()?;
 
@@ -442,10 +631,11 @@ fn pick_local_paths(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
             continue;
         }
 
-        // If only ".." selected, navigate up
         if selections == vec![0] {
             if let Some(parent) = current_dir.parent() {
                 current_dir = parent.to_path_buf();
+            } else if cfg!(windows) {
+                current_dir = pick_windows_drive(theme)?;
             }
             continue;
         }
@@ -453,7 +643,7 @@ fn pick_local_paths(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
         let mut selected = Vec::new();
         for idx in selections {
             if idx == 0 {
-                continue; // skip ".."
+                continue;
             }
             selected.push(entries[idx - 1].1.clone());
         }
@@ -462,6 +652,32 @@ fn pick_local_paths(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
             return Ok(selected);
         }
     }
+}
+
+enum StartChoice {
+    Path(PathBuf),
+    Drives,
+    Manual,
+}
+
+fn pick_windows_drive(theme: &ColorfulTheme) -> Result<PathBuf> {
+    let mut drives: Vec<PathBuf> = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let p = PathBuf::from(format!("{}:\\", letter as char));
+        if p.exists() {
+            drives.push(p);
+        }
+    }
+    if drives.is_empty() {
+        bail!("no drives detected");
+    }
+    let labels: Vec<String> = drives.iter().map(|d| d.display().to_string()).collect();
+    let idx = Select::with_theme(theme)
+        .with_prompt("Select drive")
+        .items(&labels)
+        .default(0)
+        .interact()?;
+    Ok(drives[idx].clone())
 }
 
 async fn transfer_with_progress(
@@ -479,13 +695,13 @@ async fn transfer_with_progress(
 
     let file_count = scan.files.len();
     let worker_count = default_jobs(file_count);
-    println!(
-        "  {} files, {} dirs, {}, {} workers",
+    ui::info(&format!(
+        "{} files · {} dirs · {} · {} workers",
         file_count,
         scan.directories.len(),
         util::format_size(scan.total_bytes),
         worker_count,
-    );
+    ));
 
     // Create directories first
     if !scan.directories.is_empty() {
@@ -510,16 +726,17 @@ async fn transfer_with_progress(
         }
     }
 
-    // Transfer files with progress
     let multi = MultiProgress::new();
     let overall_bar = multi.add(ProgressBar::new(scan.total_bytes));
     overall_bar.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
+            .template(
+                "  {spinner:.cyan} [{bar:36.cyan/blue}] {bytes:>10}/{total_bytes:<10} {binary_bytes_per_sec:>11} eta {eta:<5} {msg}",
+            )
             .unwrap()
-            .progress_chars("#>-"),
+            .progress_chars("█▉▊▋▌▍▎▏ "),
     );
-    overall_bar.set_message(format!("0/{file_count} files"));
+    overall_bar.set_message(ui::dim(&format!("0/{file_count} files")));
 
     let transferred_bytes = Arc::new(AtomicU64::new(0));
     let done_files = Arc::new(AtomicUsize::new(0));
@@ -536,9 +753,9 @@ async fn transfer_with_progress(
         let file_bar = multi.add(ProgressBar::new(entry.size));
         file_bar.set_style(
             ProgressStyle::default_bar()
-                .template("  {prefix:.dim} [{bar:30}] {bytes}/{total_bytes}")
+                .template("    {prefix:.dim} [{bar:28.green/black}] {bytes}/{total_bytes}")
                 .unwrap()
-                .progress_chars("#>-"),
+                .progress_chars("█▉▊▋▌▍▎▏ "),
         );
         file_bar.set_prefix(entry.relative_path.clone());
         let overall = overall_bar.clone();
@@ -559,7 +776,10 @@ async fn transfer_with_progress(
             .await;
             done.fetch_add(1, Ordering::Relaxed);
             file_bar.finish_and_clear();
-            overall.set_message(format!("{}/{fc} files", done.load(Ordering::Relaxed)));
+            overall.set_message(ui::dim(&format!(
+                "{}/{fc} files",
+                done.load(Ordering::Relaxed)
+            )));
             (entry.relative_path.clone(), result)
         });
     }
@@ -578,18 +798,18 @@ async fn transfer_with_progress(
         }
     }
 
-    overall_bar.finish_with_message("done");
+    overall_bar.finish_with_message(ui::ok("done"));
 
-    println!(
-        "  transferred: {}, skipped: {}, errors: {}",
-        transferred,
-        skipped,
-        errors.len()
-    );
-    for err in &errors {
-        eprintln!("  error: {err}");
+    println!();
+    ui::kv("transferred", &transferred.to_string());
+    if skipped > 0 {
+        ui::kv("skipped", &skipped.to_string());
     }
     if !errors.is_empty() {
+        ui::kv("errors", &errors.len().to_string());
+        for err in &errors {
+            ui::error(err);
+        }
         bail!("some transfers failed");
     }
     Ok(())

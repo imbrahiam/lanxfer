@@ -14,6 +14,7 @@ use crate::discovery;
 use crate::protocol::{
     ControlMessage, PROTOCOL_VERSION, PrepareStatus, read_control, send_control,
 };
+use crate::ui;
 use crate::util;
 
 #[derive(Debug, Clone)]
@@ -44,34 +45,38 @@ pub(crate) struct ScanResult {
 }
 
 pub async fn discover(discovery_port: u16, timeout_ms: u64) -> Result<()> {
-    let ifaces = discovery::get_interface_summary();
-    println!("scanning interfaces:");
-    for iface in &ifaces {
-        println!("  {iface}");
+    ui::section("Interfaces");
+    for iface in &discovery::get_interface_summary() {
+        ui::info(iface.trim_start());
     }
-    println!();
 
+    ui::section("Receivers");
     let hosts = discovery::discover_hosts(discovery_port, timeout_ms).await?;
     if hosts.is_empty() {
-        println!("no receivers found");
+        ui::warn("no receivers found");
         return Ok(());
     }
 
+    println!(
+        "  {}  {}  {}  {}",
+        ui::dim(&format!("{:<20}", "HOST")),
+        ui::dim(&format!("{:<22}", "ENDPOINT")),
+        ui::dim(&format!("{:<14}", "PLATFORM")),
+        ui::dim("AUTH"),
+    );
     for host in hosts {
-        println!(
-            "{} {}:{} | {} {} | auth:{} | proto:{}",
-            host.reply.host,
-            host.ip,
-            host.reply.control_port,
-            host.reply.device.os,
-            host.reply.device.arch,
-            if host.reply.auth_required {
-                "required"
-            } else {
-                "off"
-            },
-            host.reply.device.protocol_version
+        let host_pad = format!("{:<20}", host.reply.host);
+        let endpoint_pad = format!("{:<22}", format!("{}:{}", host.ip, host.reply.control_port));
+        let platform_pad = format!(
+            "{:<14}",
+            format!("{} {}", host.reply.device.os, host.reply.device.arch)
         );
+        let auth = if host.reply.auth_required {
+            ui::yellow("required")
+        } else {
+            ui::dim("off")
+        };
+        println!("  {}  {}  {}  {}", ui::bold(&host_pad), endpoint_pad, platform_pad, auth);
     }
     Ok(())
 }
@@ -87,40 +92,44 @@ pub async fn connect_interactive(
         return Ok(());
     }
 
-    println!("scanning all network interfaces for receivers...");
+    ui::section("Discover");
+    ui::info("scanning all network interfaces…");
     let hosts = discovery::discover_hosts(discovery_port, timeout_ms).await?;
     if hosts.is_empty() {
-        println!("no receivers found");
+        ui::warn("no receivers found");
         return Ok(());
     }
 
     if hosts.len() == 1 {
         let host = &hosts[0];
-        println!("found single receiver, connecting...");
+        ui::success(&format!("found single receiver {}", ui::bold(&host.reply.host)));
         connect_and_list_destinations(&host.ip, host.reply.control_port).await?;
         return Ok(());
     }
 
-    println!("\nfound {} receivers:\n", hosts.len());
+    ui::section("Receivers");
     for (i, host) in hosts.iter().enumerate() {
         println!(
-            "  {:>2}. {} {}:{} | {} {} | auth:{}",
-            i + 1,
-            host.reply.host,
-            host.ip,
-            host.reply.control_port,
-            host.reply.device.os,
-            host.reply.device.arch,
-            if host.reply.auth_required {
-                "required"
-            } else {
-                "off"
-            },
+            "  {} {}  {}",
+            ui::yellow(&format!("{:>2}.", i + 1)),
+            ui::bold(&format!("{:<20}", host.reply.host)),
+            ui::dim(&format!(
+                "{}:{}  {} {}  auth:{}",
+                host.ip,
+                host.reply.control_port,
+                host.reply.device.os,
+                host.reply.device.arch,
+                if host.reply.auth_required { "required" } else { "off" },
+            )),
         );
     }
 
     let (stream, device) = loop {
-        print!("\nselect receiver (1-{}) or 0 to quit: ", hosts.len());
+        print!(
+            "\n  {} select receiver (1-{}) or 0 to quit: ",
+            console::style("▶").yellow().bold(),
+            hosts.len()
+        );
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -129,7 +138,7 @@ pub async fn connect_interactive(
             Err(_) => continue,
         };
         if choice == 0 {
-            println!("cancelled");
+            ui::info("cancelled");
             return Ok(());
         }
         if choice >= 1 && choice <= hosts.len() {
@@ -138,33 +147,31 @@ pub async fn connect_interactive(
         }
     };
 
-    println!(
-        "\nconnected to {} | {} {} | protocol {}",
-        device.host_name, device.os, device.arch, device.protocol_version
-    );
+    ui::success(&format!(
+        "connected to {} ({} {}, protocol {})",
+        ui::bold(&device.host_name),
+        device.os,
+        device.arch,
+        device.protocol_version
+    ));
     drop(stream);
     Ok(())
 }
 
 async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
     let (mut stream, device) = connect_and_handshake(target, port).await?;
-    println!(
-        "connected to {} | {} {} | protocol {}",
-        device.host_name, device.os, device.arch, device.protocol_version
-    );
+    ui::success(&format!(
+        "connected to {} ({} {}, protocol {})",
+        ui::bold(&device.host_name),
+        device.os,
+        device.arch,
+        device.protocol_version
+    ));
     send_control(&mut stream, &ControlMessage::ListDestinations).await?;
     let reply = read_control(&mut stream).await?;
 
     match reply {
-        ControlMessage::Destinations { items } => {
-            for item in items {
-                let writable = if item.read_only { "ro" } else { "rw" };
-                println!(
-                    "{} | free {} bytes | {}",
-                    item.path, item.available_bytes, writable
-                );
-            }
-        }
+        ControlMessage::Destinations { items } => print_destination_table(&items),
         ControlMessage::Error { message } => bail!("{message}"),
         other => bail!("unexpected server response: {other:?}"),
     }
@@ -173,26 +180,43 @@ async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
 
 pub async fn print_destinations(target: &str, port: u16) -> Result<()> {
     let (mut stream, device) = connect_and_handshake(target, port).await?;
-    println!(
-        "connected to {} | {} {} | protocol {}",
-        device.host_name, device.os, device.arch, device.protocol_version
-    );
+    ui::success(&format!(
+        "connected to {} ({} {}, protocol {})",
+        ui::bold(&device.host_name),
+        device.os,
+        device.arch,
+        device.protocol_version
+    ));
     send_control(&mut stream, &ControlMessage::ListDestinations).await?;
     let reply = read_control(&mut stream).await?;
 
     match reply {
         ControlMessage::Destinations { items } => {
-            for item in items {
-                let writable = if item.read_only { "ro" } else { "rw" };
-                println!(
-                    "{} | free {} bytes | {}",
-                    item.path, item.available_bytes, writable
-                );
-            }
+            print_destination_table(&items);
             Ok(())
         }
         ControlMessage::Error { message } => bail!("{message}"),
         other => bail!("unexpected server response: {other:?}"),
+    }
+}
+
+fn print_destination_table(items: &[crate::protocol::DestinationInfo]) {
+    ui::section("Drives");
+    println!(
+        "  {}  {}  {}",
+        ui::dim(&format!("{:<28}", "PATH")),
+        ui::dim(&format!("{:>12}", "FREE")),
+        ui::dim("MODE"),
+    );
+    for item in items {
+        let mode = if item.read_only {
+            ui::dim("read-only")
+        } else {
+            ui::ok("writable")
+        };
+        let path_pad = format!("{:<28}", item.path);
+        let free_pad = format!("{:>12}", util::format_size(item.available_bytes));
+        println!("  {}  {}  {}", ui::bold(&path_pad), free_pad, mode);
     }
 }
 
@@ -214,21 +238,24 @@ pub async fn send_path(
     }
 
     let worker_count = jobs.unwrap_or_else(|| default_jobs(scan.files.len()));
-    println!(
-        "prepared {} files, {} directories, {} bytes, workers {}{}",
-        scan.files.len(),
-        scan.directories.len(),
-        scan.total_bytes,
-        worker_count,
-        if dry_run { " (dry-run)" } else { "" }
-    );
+    ui::section("Plan");
+    ui::kv("files", &scan.files.len().to_string());
+    ui::kv("directories", &scan.directories.len().to_string());
+    ui::kv("size", &util::format_size(scan.total_bytes));
+    ui::kv("workers", &worker_count.to_string());
+    if dry_run {
+        ui::warn("dry-run mode — no files will be written");
+    }
 
     let (stream, device) = connect_and_handshake(target, port).await?;
     drop(stream);
-    println!(
-        "target device: {} | {} {} | protocol {}",
-        device.host_name, device.os, device.arch, device.protocol_version
-    );
+    ui::success(&format!(
+        "target {} ({} {}, protocol {})",
+        ui::bold(&device.host_name),
+        device.os,
+        device.arch,
+        device.protocol_version
+    ));
 
     create_directories(
         target,
@@ -254,12 +281,12 @@ pub async fn send_path(
         bar.set_style(
             ProgressStyle::default_bar()
                 .template(
-                    "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+                    "  {spinner:.cyan} [{bar:36.cyan/blue}] {bytes:>10}/{total_bytes:<10} {binary_bytes_per_sec:>11} eta {eta:<5} {msg}",
                 )
                 .unwrap()
-                .progress_chars("#>-"),
+                .progress_chars("█▉▊▋▌▍▎▏ "),
         );
-        bar.set_message(format!("0/{} files", scan.files.len()));
+        bar.set_message(ui::dim(&format!("0/{} files", scan.files.len())));
         bar
     });
 
@@ -277,9 +304,9 @@ pub async fn send_path(
             let bar = m.add(ProgressBar::new(entry.size));
             bar.set_style(
                 ProgressStyle::default_bar()
-                    .template("  {prefix:.dim} [{bar:30}] {bytes}/{total_bytes}")
+                    .template("    {prefix:.dim} [{bar:28.green/black}] {bytes}/{total_bytes}")
                     .unwrap()
-                    .progress_chars("#>-"),
+                    .progress_chars("█▉▊▋▌▍▎▏ "),
             );
             bar.set_prefix(entry.relative_path.clone());
             bar
@@ -307,7 +334,11 @@ pub async fn send_path(
                 fb.finish_and_clear();
             }
             if let Some(ob) = &overall {
-                ob.set_message(format!("{}/{} files", done.load(Ordering::Relaxed), fc));
+                ob.set_message(ui::dim(&format!(
+                    "{}/{} files",
+                    done.load(Ordering::Relaxed),
+                    fc
+                )));
             }
             result
         });
@@ -328,20 +359,21 @@ pub async fn send_path(
     }
 
     if let Some(ob) = &overall_bar {
-        ob.finish_with_message("done");
+        ob.finish_with_message(ui::ok("done"));
     }
 
-    println!(
-        "summary: transferred={}, skipped_existing={}, conflicts={}, errors={}",
-        transferred_files,
-        skipped_existing,
-        conflicts,
-        errors.len()
-    );
-
+    println!();
+    ui::kv("transferred", &transferred_files.to_string());
+    if skipped_existing > 0 {
+        ui::kv("skipped", &skipped_existing.to_string());
+    }
+    if conflicts > 0 {
+        ui::kv("conflicts", &conflicts.to_string());
+    }
     if !errors.is_empty() {
+        ui::kv("errors", &errors.len().to_string());
         for err in errors {
-            eprintln!("error: {err}");
+            ui::error(&err);
         }
         bail!("one or more file transfers failed");
     }
@@ -719,25 +751,9 @@ fn path_to_slash_string(path: &Path) -> Result<String> {
 }
 
 fn tune_socket(stream: &TcpStream) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let buf_size: libc::c_int = 4 * 1024 * 1024; // 4 MB socket buffer
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &buf_size as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &buf_size as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
 }
 
 fn default_jobs(file_count: usize) -> usize {

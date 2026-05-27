@@ -12,31 +12,30 @@ use crate::protocol::{
 use crate::storage;
 use crate::util;
 
+pub fn ensure_pairing_code(opt: Option<String>) -> String {
+    opt.unwrap_or_else(util::generate_pairing_code)
+}
+
 pub async fn run_server(
     bind: String,
     discovery_port: u16,
-    pairing_code: Option<String>,
+    pairing_code: String,
+    quiet_errors: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     let local = listener.local_addr()?;
     let device = util::local_device_info();
-    let pairing_code = pairing_code.unwrap_or_else(util::generate_pairing_code);
 
     let discovery_device = device.clone();
     tokio::spawn(async move {
         if let Err(err) =
             discovery::run_responder(discovery_port, local.port(), true, discovery_device).await
         {
-            eprintln!("discovery responder stopped: {err:#}");
+            if !quiet_errors {
+                eprintln!("discovery responder stopped: {err:#}");
+            }
         }
     });
-
-    println!(
-        "lanxfer receiver listening on {} (discovery udp {})",
-        local, discovery_port
-    );
-    println!("device: {} {} {}", device.host_name, device.os, device.arch);
-    println!("pairing code: {pairing_code}");
 
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -44,32 +43,18 @@ pub async fn run_server(
         let server_code = pairing_code.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_client(socket, server_device, server_code).await {
-                eprintln!("client {peer} error: {err:#}");
+                if !quiet_errors {
+                    eprintln!("client {peer} error: {err:#}");
+                }
             }
         });
     }
 }
 
 fn tune_socket(stream: &TcpStream) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let buf_size: libc::c_int = 4 * 1024 * 1024;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &buf_size as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &buf_size as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
 }
 
 async fn handle_client(
