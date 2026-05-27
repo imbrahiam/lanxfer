@@ -1,9 +1,10 @@
 # lanxfer
 
-Fast, resumable LAN file transfer CLI with interactive mode. Built for moving large files between machines on the same network at maximum speed.
+Fast, resumable LAN file transfer CLI with zero-config peer mode. Built for moving large files between machines on the same network at maximum speed.
 
 ## Features
 
+- **Peer mode** - Just run `lanxfer` on each machine. Each peer becomes both sender and receiver. No `serve` step required.
 - **Interactive mode** - Browse remote directories, pick local files, select destination drives — all from one session
 - **Smart discovery** - UDP broadcast with automatic subnet scan fallback when broadcast is blocked
 - **Resumable transfers** - Interrupted transfers resume from where they left off via `.lanxfer.part` files
@@ -40,43 +41,33 @@ sudo ln -sf $(pwd)/target/release/lanxfer /usr/local/bin/lanxfer
 sudo cp target/release/lanxfer /usr/local/bin/
 ```
 
+```powershell
+# Windows (PowerShell) - copy to a folder on PATH, or add the target folder to PATH:
+Copy-Item .\target\release\lanxfer.exe "$env:USERPROFILE\bin\lanxfer.exe"
+# (one-time) put $env:USERPROFILE\bin on PATH via System Properties -> Environment Variables
+```
+
 ## Quick Start
 
-### 1. Start the receiver
+### Peer mode (the easy way)
 
-On the machine that will **receive** files:
-
-```bash
-lanxfer serve
-```
-
-Output:
-```
-lanxfer receiver listening on 0.0.0.0:44818 (discovery udp 44819)
-device: mypc linux x86_64
-pairing code: A1B2C3
-```
-
-### 2. Send files (interactive)
-
-On the machine that will **send** files, just run:
+Run `lanxfer` on every machine. That's it.
 
 ```bash
 lanxfer
 ```
 
-This launches interactive mode:
+Each peer starts a background receiver, shows its own pairing code, and lists the other peers it discovers on the LAN. Pick a peer, enter its code (shown on its screen), browse, send. Done.
 
-1. **Discovers receivers** on the network (broadcast + subnet scan fallback)
-2. **Prompts for pairing code** shown on the receiver
-3. **Main menu**: Send files, List drives, Exit
-4. **Select destination drive** on the remote machine
-5. **Browse remote directories** to pick where files land
-6. **Browse local filesystem** — start from current dir, home, desktop, root, or any path
-7. **Select files/folders** to send (multi-select with space bar)
-8. **Transfers** with progress bars and BLAKE3 verification
+### Headless receiver
 
-### 3. Or use direct commands
+If you want a machine to only receive (e.g., a server with no interactive shell):
+
+```bash
+lanxfer serve
+```
+
+### Direct commands
 
 ```bash
 # Discover receivers
@@ -93,9 +84,9 @@ lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3 --overwrite --jo
 
 | Command | Description |
 |---------|-------------|
-| `lanxfer` | Interactive mode (default) |
-| `lanxfer interactive` | Same as above, explicit |
-| `lanxfer serve` | Start receiver server |
+| `lanxfer` | Peer mode (default) — auto-serve + auto-discover |
+| `lanxfer interactive` | Sender-only interactive session |
+| `lanxfer serve` | Headless receiver |
 | `lanxfer discover` | Find receivers on network |
 | `lanxfer connect` | Connect to a receiver (discovery or `--target IP`) |
 | `lanxfer destinations <ip>` | List drives on a receiver |
@@ -136,6 +127,12 @@ sudo ufw allow 44818/tcp
 sudo ufw allow 44819/udp
 
 # macOS - usually works out of the box (accept the firewall prompt)
+```
+
+```powershell
+# Windows (Run PowerShell as Administrator)
+New-NetFirewallRule -DisplayName "lanxfer TCP" -Direction Inbound -Protocol TCP -LocalPort 44818 -Action Allow
+New-NetFirewallRule -DisplayName "lanxfer UDP" -Direction Inbound -Protocol UDP -LocalPort 44819 -Action Allow
 ```
 
 ## Architecture

@@ -7,7 +7,8 @@ use crate::protocol::{DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT};
 #[command(
     name = "lanxfer",
     version,
-    about = "Fast resumable LAN file transfer CLI"
+    about = "Fast resumable LAN file transfer CLI",
+    long_about = "Fast resumable LAN file transfer CLI.\n\nRun with no arguments to enter peer mode: a background receiver starts, other peers on the LAN are auto-discovered, and you can pick one and send."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -16,7 +17,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Launch interactive transfer session.
+    /// Sender-only interactive session (does not start a local receiver).
     Interactive {
         #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
         discovery_port: u16,
@@ -25,7 +26,7 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
         port: u16,
     },
-    /// Run receiver server on this machine.
+    /// Run a headless receiver (no interactive UI).
     Serve {
         #[arg(long, default_value = "0.0.0.0:44818")]
         bind: String,

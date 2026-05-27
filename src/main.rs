@@ -5,6 +5,7 @@ mod interactive;
 mod protocol;
 mod server;
 mod storage;
+mod ui;
 mod util;
 
 use anyhow::Result;
@@ -17,15 +18,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None | Some(Command::Interactive { .. }) => {
-            let (discovery_port, timeout_ms, port) = match cli.command {
-                Some(Command::Interactive {
-                    discovery_port,
-                    timeout_ms,
-                    port,
-                }) => (discovery_port, timeout_ms, port),
-                _ => (DEFAULT_DISCOVERY_PORT, 1500, DEFAULT_CONTROL_PORT),
-            };
+        None => {
+            interactive::run_peer_mode(DEFAULT_DISCOVERY_PORT, 1500, DEFAULT_CONTROL_PORT).await?;
+        }
+        Some(Command::Interactive {
+            discovery_port,
+            timeout_ms,
+            port,
+        }) => {
             interactive::run_interactive(discovery_port, timeout_ms, port).await?;
         }
         Some(Command::Serve {
@@ -33,7 +33,17 @@ async fn main() -> Result<()> {
             discovery_port,
             pairing_code,
         }) => {
-            server::run_server(bind, discovery_port, pairing_code).await?;
+            let code = server::ensure_pairing_code(pairing_code);
+            let device = util::local_device_info();
+            ui::banner();
+            ui::section("Receiver");
+            ui::kv("host", &device.host_name);
+            ui::kv("platform", &format!("{} {}", device.os, device.arch));
+            ui::kv("listening", &format!("tcp {bind}  ·  udp {discovery_port}"));
+            ui::kv("pairing code", &ui::yellow(&code));
+            println!();
+            ui::info("waiting for senders…  (Ctrl-C to stop)");
+            server::run_server(bind, discovery_port, code, false).await?;
         }
         Some(Command::Discover {
             discovery_port,
