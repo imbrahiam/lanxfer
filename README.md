@@ -13,6 +13,7 @@ Fast, resumable LAN file transfer CLI with zero-config peer mode. Built for movi
 - **Progress bars** - Real-time per-file and overall progress with speed and ETA
 - **Pairing code auth** - Simple 6-character code protects against unauthorized writes
 - **Cross-platform** - macOS, Linux, Windows
+- **Sleep prevention** - Keeps the system awake while lanxfer is running so long transfers are not interrupted (the display may still turn off)
 
 ## Install
 

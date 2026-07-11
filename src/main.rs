@@ -33,9 +33,34 @@ fn init_logging() {
     }
 }
 
+/// Hold an OS-level power assertion for the lifetime of the process. The
+/// display may still turn off; only system sleep (which would interrupt
+/// networking and disk I/O) is inhibited.
+fn prevent_system_sleep() -> Option<keepawake::KeepAwake> {
+    match keepawake::Builder::default()
+        .display(false)
+        .idle(true)
+        .sleep(true)
+        .reason("LAN file transfer in progress")
+        .app_name("lanxfer")
+        .app_reverse_domain("io.github.imbrahiam.lanxfer")
+        .create()
+    {
+        Ok(guard) => {
+            log::info!("system sleep inhibited while lanxfer is running");
+            Some(guard)
+        }
+        Err(err) => {
+            log::warn!("could not inhibit system sleep: {err}");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     init_logging();
+    let _sleep_inhibitor = prevent_system_sleep();
     let cli = Cli::parse();
     let result = run(cli).await;
     let _ = console::Term::stdout().show_cursor();
