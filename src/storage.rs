@@ -6,23 +6,54 @@ use sysinfo::Disks;
 use crate::protocol::{DestinationInfo, DirEntry};
 
 pub fn list_destinations() -> Vec<DestinationInfo> {
-    let mut destinations = Vec::new();
     let disks = Disks::new_with_refreshed_list();
 
+    // Common user folders first — saves senders from navigating
+    // C:\Users\name\... or /Users/name/... from the drive root.
+    let shortcuts = [
+        ("Home", dirs::home_dir()),
+        ("Desktop", dirs::desktop_dir()),
+        ("Downloads", dirs::download_dir()),
+        ("Documents", dirs::document_dir()),
+    ];
+    let mut destinations = Vec::new();
+    for (label, dir) in shortcuts {
+        if let Some(dir) = dir {
+            if dir.is_dir() {
+                destinations.push(DestinationInfo {
+                    label: label.to_string(),
+                    available_bytes: free_space_for(&disks, &dir),
+                    path: dir.to_string_lossy().to_string(),
+                    read_only: false,
+                });
+            }
+        }
+    }
+
+    let mut drives = Vec::new();
     for disk in disks.list() {
         let mount = disk.mount_point();
         let path = mount.to_string_lossy().to_string();
-        let name = disk.name().to_string_lossy();
-        destinations.push(DestinationInfo {
-            label: format!("{name} ({path})"),
+        drives.push(DestinationInfo {
+            label: disk.name().to_string_lossy().to_string(),
             path,
             available_bytes: disk.available_space(),
             read_only: disk.is_read_only(),
         });
     }
-
-    destinations.sort_by(|a, b| a.path.cmp(&b.path));
+    drives.sort_by(|a, b| a.path.cmp(&b.path));
+    destinations.extend(drives);
     destinations
+}
+
+fn free_space_for(disks: &Disks, path: &Path) -> u64 {
+    disks
+        .list()
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+        .unwrap_or(0)
 }
 
 pub fn list_directory(path: &Path) -> Result<Vec<DirEntry>> {

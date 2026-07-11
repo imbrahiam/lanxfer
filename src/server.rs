@@ -1,13 +1,17 @@
 use anyhow::{Result, anyhow, bail};
-use std::cmp;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::fs::{self, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
 use crate::discovery;
 use crate::protocol::{
-    ControlMessage, PROTOCOL_VERSION, PrepareStatus, read_control, send_control,
+    ControlMessage, DirSpec, FileAction, FileSpec, PROTOCOL_VERSION, PlanAction, read_control,
+    send_control,
 };
 use crate::storage;
 use crate::util;
@@ -16,20 +20,49 @@ pub fn ensure_pairing_code(opt: Option<String>) -> String {
     opt.unwrap_or_else(util::generate_pairing_code)
 }
 
+type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
+
+struct Session {
+    dest_root: String,
+    overwrite: bool,
+    files: Mutex<HashMap<u32, FileState>>,
+    /// FileDone / RestartAck messages routed to the control connection.
+    out_tx: mpsc::UnboundedSender<ControlMessage>,
+}
+
+struct FileState {
+    size: u64,
+    mtime_secs: i64,
+    final_path: PathBuf,
+    part_path: PathBuf,
+    start_offset: u64,
+    received: u64,
+    /// Plain (non-striped) files: streaming hasher, pre-seeded with the
+    /// resume prefix. Taken while a unit is in flight.
+    hasher: Option<blake3::Hasher>,
+    /// Striped files: per-stripe subtree chaining values.
+    stripe_cvs: HashMap<u32, util::StripeCv>,
+    done: bool,
+    expects_data: bool,
+}
+
 pub async fn run_server(
     bind: String,
     discovery_port: u16,
     pairing_code: String,
     quiet_errors: bool,
+    require_auth: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     let local = listener.local_addr()?;
     let device = util::local_device_info();
+    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
 
     let discovery_device = device.clone();
     tokio::spawn(async move {
         if let Err(err) =
-            discovery::run_responder(discovery_port, local.port(), true, discovery_device).await
+            discovery::run_responder(discovery_port, local.port(), require_auth, discovery_device)
+                .await
         {
             if !quiet_errors {
                 eprintln!("discovery responder stopped: {err:#}");
@@ -41,8 +74,11 @@ pub async fn run_server(
         let (socket, peer) = listener.accept().await?;
         let server_device = device.clone();
         let server_code = pairing_code.clone();
+        let sessions = Arc::clone(&sessions);
         tokio::spawn(async move {
-            if let Err(err) = handle_client(socket, server_device, server_code).await {
+            if let Err(err) =
+                handle_client(socket, server_device, server_code, require_auth, sessions).await
+            {
                 if !quiet_errors {
                     eprintln!("client {peer} error: {err:#}");
                 }
@@ -61,6 +97,8 @@ async fn handle_client(
     mut stream: TcpStream,
     server_device: crate::protocol::DeviceInfo,
     pairing_code: String,
+    require_auth: bool,
+    sessions: Sessions,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     tune_socket(&stream);
@@ -73,7 +111,7 @@ async fn handle_client(
                 &ControlMessage::HelloAck {
                     version: PROTOCOL_VERSION,
                     server: server_device,
-                    auth_required: true,
+                    auth_required: require_auth,
                 },
             )
             .await?;
@@ -118,219 +156,24 @@ async fn handle_client(
                 relative_path,
                 auth_code,
             } => {
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code) {
-                    send_control(
-                        &mut stream,
-                        &ControlMessage::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?;
-                    continue;
-                }
-                let root = match storage::ensure_destination_root(&destination_path) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::Error {
-                                message: err.to_string(),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let target = if relative_path.is_empty() {
-                    root
-                } else {
-                    let rel = match storage::sanitize_relative_path(&relative_path) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            send_control(
-                                &mut stream,
-                                &ControlMessage::Error {
-                                    message: err.to_string(),
-                                },
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                    root.join(rel)
-                };
-                let entries = match storage::list_directory(&target) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::Error {
-                                message: err.to_string(),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                send_control(
-                    &mut stream,
-                    &ControlMessage::DirectoryContents {
-                        relative_path,
-                        entries,
-                    },
-                )
-                .await?;
-            }
-            ControlMessage::CreateDirectory {
-                destination_path,
-                relative_path,
-                mtime_secs,
-                auth_code,
-                dry_run,
-            } => {
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code) {
-                    send_control(
-                        &mut stream,
-                        &ControlMessage::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?;
-                    continue;
-                }
-                let root = match storage::ensure_destination_root(&destination_path) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::Error {
-                                message: err.to_string(),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let rel = match storage::sanitize_relative_path(&relative_path) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::Error {
-                                message: err.to_string(),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let dir = root.join(rel);
-                if !dry_run {
-                    fs::create_dir_all(&dir).await?;
-                    let _ = util::set_mtime(&dir, mtime_secs).await;
-                }
-                send_control(
-                    &mut stream,
-                    &ControlMessage::DirectoryCreated { relative_path },
-                )
-                .await?;
-            }
-            ControlMessage::PrepareUpload {
-                destination_path,
-                relative_path,
-                file_size,
-                file_hash,
-                overwrite,
-                auth_code,
-                dry_run,
-                ..
-            } => {
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code) {
-                    send_control(
-                        &mut stream,
-                        &ControlMessage::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?;
-                    continue;
-                }
-                let reply = match prepare_upload(
+                let reply = browse_reply(
                     &destination_path,
-                    &relative_path,
-                    file_size,
-                    &file_hash,
-                    overwrite,
-                    dry_run,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(err) => ControlMessage::Error {
-                        message: err.to_string(),
-                    },
-                };
+                    relative_path,
+                    auth_code.as_deref(),
+                    &pairing_code,
+                    require_auth,
+                );
                 send_control(&mut stream, &reply).await?;
             }
-            ControlMessage::RestartUpload {
+            ControlMessage::BeginSession {
                 destination_path,
-                relative_path,
                 auth_code,
-            } => {
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code) {
-                    send_control(
-                        &mut stream,
-                        &ControlMessage::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?;
-                    continue;
-                }
-                let (_, part_path) =
-                    match storage::build_target_paths(&destination_path, &relative_path) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            send_control(
-                                &mut stream,
-                                &ControlMessage::Error {
-                                    message: err.to_string(),
-                                },
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(&part_path)
-                    .await?;
-                file.set_len(0).await?;
-                file.flush().await?;
-                send_control(
-                    &mut stream,
-                    &ControlMessage::UploadReady {
-                        status: PrepareStatus::Ready,
-                        offset: 0,
-                        partial_hash: None,
-                        message: None,
-                    },
-                )
-                .await?;
-            }
-            ControlMessage::BeginUpload {
-                destination_path,
-                relative_path,
-                offset,
-                file_size,
-                file_hash,
-                mtime_secs,
                 overwrite,
-                auth_code,
                 dry_run,
+                files,
+                dirs,
             } => {
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code) {
+                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code, require_auth) {
                     send_control(
                         &mut stream,
                         &ControlMessage::Error {
@@ -340,108 +183,50 @@ async fn handle_client(
                     .await?;
                     continue;
                 }
-
-                let (final_path, part_path) =
-                    match storage::build_target_paths(&destination_path, &relative_path) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            send_control(
-                                &mut stream,
-                                &ControlMessage::Error {
-                                    message: err.to_string(),
-                                },
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-
                 if dry_run {
-                    send_control(&mut stream, &ControlMessage::BeginAck { offset }).await?;
+                    let reply =
+                        match plan_session(&destination_path, overwrite, &files, &dirs, true).await
+                        {
+                            Ok((actions, _)) => ControlMessage::SessionPlan {
+                                session_id: String::new(),
+                                actions,
+                            },
+                            Err(err) => ControlMessage::Error {
+                                message: err.to_string(),
+                            },
+                        };
+                    send_control(&mut stream, &reply).await?;
+                    continue;
+                }
+                // Real session: this connection becomes the session's control
+                // channel until the client disconnects.
+                return run_session_control(
+                    stream,
+                    sessions,
+                    destination_path,
+                    overwrite,
+                    files,
+                    dirs,
+                )
+                .await;
+            }
+            ControlMessage::JoinSession { session_id } => {
+                let session = sessions.lock().unwrap().get(&session_id).cloned();
+                let Some(session) = session else {
                     send_control(
                         &mut stream,
-                        &ControlMessage::TransferResult {
-                            verified: true,
-                            final_hash: String::new(),
-                            bytes_received: file_size,
-                            error: None,
+                        &ControlMessage::Error {
+                            message: "unknown session".to_string(),
                         },
                     )
                     .await?;
                     continue;
-                }
-
-                match fs::metadata(&part_path).await {
-                    Ok(meta) if meta.len() != offset => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::Error {
-                                message: format!(
-                                    "offset mismatch. expected {}, got {}",
-                                    meta.len(),
-                                    offset
-                                ),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::Error {
-                                message: format!("missing part file: {err}"),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                }
-
-                send_control(&mut stream, &ControlMessage::BeginAck { offset }).await?;
-
-                match receive_transfer(
-                    &mut stream,
-                    &part_path,
-                    &final_path,
-                    file_size,
-                    offset,
-                    &file_hash,
-                    overwrite,
-                    mtime_secs,
-                )
-                .await
-                {
-                    Ok((bytes_received, final_hash, verified)) => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::TransferResult {
-                                verified,
-                                final_hash,
-                                bytes_received,
-                                error: if verified {
-                                    None
-                                } else {
-                                    Some("hash mismatch".to_string())
-                                },
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(err) => {
-                        send_control(
-                            &mut stream,
-                            &ControlMessage::TransferResult {
-                                verified: false,
-                                final_hash: String::new(),
-                                bytes_received: 0,
-                                error: Some(err.to_string()),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                };
+                send_control(&mut stream, &ControlMessage::JoinAck).await?;
+                // This connection becomes a data channel.
+                let (read_half, _write_half) = stream.into_split();
+                let reader = BufReader::with_capacity(4 * 1024 * 1024, read_half);
+                return run_data_conn(reader, session).await;
             }
             _ => {
                 send_control(
@@ -456,7 +241,436 @@ async fn handle_client(
     }
 }
 
-fn ensure_auth(provided: Option<&str>, expected: &str) -> Result<()> {
+fn browse_reply(
+    destination_path: &str,
+    relative_path: String,
+    auth_code: Option<&str>,
+    pairing_code: &str,
+    require_auth: bool,
+) -> ControlMessage {
+    if let Err(err) = ensure_auth(auth_code, pairing_code, require_auth) {
+        return ControlMessage::Error {
+            message: err.to_string(),
+        };
+    }
+    let result = (|| -> Result<Vec<crate::protocol::DirEntry>> {
+        let root = storage::ensure_destination_root(destination_path)?;
+        let target = if relative_path.is_empty() {
+            root
+        } else {
+            root.join(storage::sanitize_relative_path(&relative_path)?)
+        };
+        storage::list_directory(&target)
+    })();
+    match result {
+        Ok(entries) => ControlMessage::DirectoryContents {
+            relative_path,
+            entries,
+        },
+        Err(err) => ControlMessage::Error {
+            message: err.to_string(),
+        },
+    }
+}
+
+async fn run_session_control(
+    stream: TcpStream,
+    sessions: Sessions,
+    destination_path: String,
+    overwrite: bool,
+    files: Vec<FileSpec>,
+    dirs: Vec<DirSpec>,
+) -> Result<()> {
+    let (actions, states) =
+        match plan_session(&destination_path, overwrite, &files, &dirs, false).await {
+            Ok(v) => v,
+            Err(err) => {
+                let mut stream = stream;
+                send_control(
+                    &mut stream,
+                    &ControlMessage::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    let session = Arc::new(Session {
+        dest_root: destination_path,
+        overwrite,
+        files: Mutex::new(states),
+        out_tx,
+    });
+    sessions
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), Arc::clone(&session));
+
+    let (mut read_half, mut write_half) = stream.into_split();
+    send_control(
+        &mut write_half,
+        &ControlMessage::SessionPlan {
+            session_id: session_id.clone(),
+            actions,
+        },
+    )
+    .await?;
+
+    // Single writer for FileDone/RestartAck — data connections feed out_tx.
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if send_control(&mut write_half, &msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Read side: RestartFile requests before data flow, then EOF when the
+    // client is finished with the session.
+    loop {
+        match read_control(&mut read_half).await {
+            Ok(ControlMessage::RestartFile { id }) => {
+                let reply = match restart_file(&session, id).await {
+                    Ok(()) => ControlMessage::RestartAck { id },
+                    Err(err) => ControlMessage::Error {
+                        message: format!("restart {id}: {err}"),
+                    },
+                };
+                let _ = session.out_tx.send(reply);
+            }
+            Ok(_) => {
+                let _ = session.out_tx.send(ControlMessage::Error {
+                    message: "unexpected message on session control connection".to_string(),
+                });
+            }
+            Err(_) => break, // client disconnected — session over
+        }
+    }
+
+    sessions.lock().unwrap().remove(&session_id);
+    drop(session);
+    writer_task.abort();
+    Ok(())
+}
+
+/// Decide per-file actions and build receiver-side state.
+/// `dry_run` skips all side effects (no mkdir, no part files).
+async fn plan_session(
+    destination_path: &str,
+    overwrite: bool,
+    files: &[FileSpec],
+    dirs: &[DirSpec],
+    dry_run: bool,
+) -> Result<(Vec<FileAction>, HashMap<u32, FileState>)> {
+    storage::ensure_destination_root(destination_path)?;
+
+    if !dry_run {
+        for dir in dirs {
+            let rel = storage::sanitize_relative_path(&dir.rel_path)?;
+            let path = PathBuf::from(destination_path).join(rel);
+            fs::create_dir_all(&path).await?;
+            let _ = util::set_mtime(&path, dir.mtime_secs).await;
+        }
+    }
+
+    let mut actions = Vec::with_capacity(files.len());
+    let mut states = HashMap::new();
+
+    for spec in files {
+        let (final_path, part_path) =
+            storage::build_target_paths(destination_path, &spec.rel_path)?;
+
+        let mut state = FileState {
+            size: spec.size,
+            mtime_secs: spec.mtime_secs,
+            final_path: final_path.clone(),
+            part_path: part_path.clone(),
+            start_offset: 0,
+            received: 0,
+            hasher: None,
+            stripe_cvs: HashMap::new(),
+            done: false,
+            expects_data: true,
+        };
+
+        let action = if let Ok(meta) = fs::metadata(&final_path).await {
+            let existing_mtime = meta
+                .modified()
+                .map(util::system_time_secs)
+                .unwrap_or(i64::MIN);
+            if meta.len() == spec.size && (existing_mtime - spec.mtime_secs).abs() <= 2 {
+                state.expects_data = false;
+                PlanAction::SkipUpToDate
+            } else if !overwrite {
+                state.expects_data = false;
+                PlanAction::Conflict
+            } else {
+                prepare_fresh(&mut state, dry_run).await?;
+                PlanAction::Send
+            }
+        } else {
+            match fs::metadata(&part_path).await {
+                Ok(part_meta)
+                    if !util::is_striped(spec.size)
+                        && part_meta.len() > 0
+                        && part_meta.len() <= spec.size =>
+                {
+                    // Resumable prefix: hash it now and keep the live hasher
+                    // so verification stays single-pass across the boundary.
+                    let offset = part_meta.len();
+                    let hasher = util::hash_prefix_hasher(&part_path, offset).await?;
+                    let partial_hash = hasher.clone().finalize().to_hex().to_string();
+                    state.start_offset = offset;
+                    state.hasher = Some(hasher);
+                    PlanAction::Resume {
+                        offset,
+                        partial_hash,
+                    }
+                }
+                _ => {
+                    // ponytail: interrupted striped files restart from zero.
+                    // Add a stripe bitmap in the part file if 64+ MiB re-sends
+                    // ever hurt in practice.
+                    prepare_fresh(&mut state, dry_run).await?;
+                    PlanAction::Send
+                }
+            }
+        };
+
+        actions.push(FileAction {
+            id: spec.id,
+            action,
+        });
+        states.insert(spec.id, state);
+    }
+
+    Ok((actions, states))
+}
+
+/// Prepare state for a from-scratch transfer. Plain files create their part
+/// file lazily on first write (data workers parallelize those syscalls —
+/// creating 10k parts serially at plan time dominates small-file transfers).
+/// Striped files preallocate now so parallel stripe writers never race.
+async fn prepare_fresh(state: &mut FileState, dry_run: bool) -> Result<()> {
+    if dry_run {
+        return Ok(());
+    }
+    if util::is_striped(state.size) {
+        if let Some(parent) = state.part_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&state.part_path)
+            .await?;
+        file.set_len(state.size).await?;
+    } else {
+        state.hasher = Some(blake3::Hasher::new());
+    }
+    Ok(())
+}
+
+/// Open the part file for writing, creating parents on demand. A fresh
+/// plain-file transfer (start at 0) truncates, so a stale longer part can
+/// never leak trailing bytes past the rename.
+async fn open_part(part_path: &std::path::Path, truncate: bool) -> Result<fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(truncate);
+    match opts.open(part_path).await {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = part_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            Ok(opts.open(part_path).await?)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn restart_file(session: &Arc<Session>, id: u32) -> Result<()> {
+    let part_path = {
+        let mut files = session.files.lock().unwrap();
+        let state = files.get_mut(&id).ok_or_else(|| anyhow!("unknown file"))?;
+        state.start_offset = 0;
+        state.received = 0;
+        state.hasher = Some(blake3::Hasher::new());
+        state.stripe_cvs.clear();
+        state.part_path.clone()
+    };
+    let file = OpenOptions::new().write(true).open(&part_path).await?;
+    file.set_len(0).await?;
+    Ok(())
+}
+
+async fn run_data_conn(mut reader: BufReader<OwnedReadHalf>, session: Arc<Session>) -> Result<()> {
+    loop {
+        let msg = match read_control(&mut reader).await {
+            Ok(msg) => msg,
+            Err(_) => return Ok(()), // sender closed the data connection
+        };
+        match msg {
+            ControlMessage::SendFile { id, offset, len } => {
+                if let Err(err) = receive_unit(&mut reader, &session, id, offset, len).await {
+                    let _ = session.out_tx.send(ControlMessage::FileDone {
+                        id,
+                        hash: String::new(),
+                        ok: false,
+                        error: Some(err.to_string()),
+                    });
+                    return Err(err); // stream position unknown — drop conn
+                }
+            }
+            other => bail!("unexpected message on data connection: {other:?}"),
+        }
+    }
+}
+
+async fn receive_unit(
+    reader: &mut BufReader<OwnedReadHalf>,
+    session: &Arc<Session>,
+    id: u32,
+    offset: u64,
+    len: u64,
+) -> Result<()> {
+    // Pull what we need out of the state, holding the lock only briefly.
+    let (part_path, striped, mut hasher, stripe_index) = {
+        let mut files = session.files.lock().unwrap();
+        let state = files
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("unknown file id {id}"))?;
+        if state.done || !state.expects_data {
+            bail!("unexpected data for file {id}");
+        }
+        if offset + len > state.size {
+            bail!("unit out of bounds for file {id}");
+        }
+        let striped = util::is_striped(state.size);
+        if striped {
+            let (stripe_start, stripe_len) =
+                util::stripe_range(state.size, (offset / util::STRIPE_SIZE) as u32);
+            if offset != stripe_start || len != stripe_len {
+                bail!("unit is not stripe-aligned for file {id}");
+            }
+            (
+                state.part_path.clone(),
+                true,
+                util::stripe_hasher((offset / util::STRIPE_SIZE) as u32),
+                (offset / util::STRIPE_SIZE) as u32,
+            )
+        } else {
+            let hasher = state
+                .hasher
+                .take()
+                .ok_or_else(|| anyhow!("file {id} already has a writer"))?;
+            if hasher.count() != offset {
+                let count = hasher.count();
+                // put it back before failing so a later attempt can see state
+                state.hasher = Some(hasher);
+                bail!("non-sequential write for file {id}: hashed {count}, unit at {offset}");
+            }
+            (state.part_path.clone(), false, hasher, 0)
+        }
+    };
+
+    let mut file = open_part(&part_path, !striped && offset == 0).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let to_read = usize::min(remaining as usize, buf.len());
+        reader
+            .read_exact(&mut buf[..to_read])
+            .await
+            .map_err(|e| anyhow!("transfer read error: {e}"))?;
+        hasher.update(&buf[..to_read]);
+        file.write_all(&buf[..to_read]).await?;
+        remaining -= to_read as u64;
+    }
+    file.flush().await?;
+    drop(file);
+
+    // Update state; detect completion.
+    let finalize = {
+        let mut files = session.files.lock().unwrap();
+        let state = files
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("file state vanished"))?;
+        state.received += len;
+        if striped {
+            state
+                .stripe_cvs
+                .insert(stripe_index, util::finish_stripe(&hasher));
+        } else {
+            state.hasher = Some(hasher);
+        }
+        let complete = state.received == state.size - state.start_offset;
+        if complete && !state.done {
+            state.done = true;
+            let hash = if striped {
+                let count = util::stripe_count(state.size);
+                let mut cvs = Vec::with_capacity(count as usize);
+                for i in 0..count {
+                    cvs.push(
+                        *state
+                            .stripe_cvs
+                            .get(&i)
+                            .ok_or_else(|| anyhow!("missing stripe {i} for file {id}"))?,
+                    );
+                }
+                util::merge_stripes(&cvs, state.size).to_hex().to_string()
+            } else {
+                state
+                    .hasher
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing hasher for file {id}"))?
+                    .finalize()
+                    .to_hex()
+                    .to_string()
+            };
+            Some((
+                hash,
+                state.part_path.clone(),
+                state.final_path.clone(),
+                state.mtime_secs,
+            ))
+        } else {
+            None
+        }
+    };
+
+    if let Some((hash, part_path, final_path, mtime_secs)) = finalize {
+        if session.overwrite && fs::metadata(&final_path).await.is_ok() {
+            let _ = fs::remove_file(&final_path).await;
+        }
+        fs::rename(&part_path, &final_path).await?;
+        // fire-and-forget: mtime is cosmetic metadata, not worth serializing
+        // 10k blocking waits into the completion path
+        tokio::spawn(async move {
+            let _ = util::set_mtime(&final_path, mtime_secs).await;
+        });
+        let _ = session.out_tx.send(ControlMessage::FileDone {
+            id,
+            hash,
+            ok: true,
+            error: None,
+        });
+    }
+    let _ = session.dest_root; // session root retained for future use in errors
+    Ok(())
+}
+
+fn ensure_auth(provided: Option<&str>, expected: &str, require_auth: bool) -> Result<()> {
+    if !require_auth {
+        return Ok(());
+    }
     let value = provided.unwrap_or_default().trim();
     if value.is_empty() {
         bail!("pairing code is required for write operations");
@@ -465,135 +679,4 @@ fn ensure_auth(provided: Option<&str>, expected: &str) -> Result<()> {
         bail!("invalid pairing code");
     }
     Ok(())
-}
-
-async fn prepare_upload(
-    destination_path: &str,
-    relative_path: &str,
-    file_size: u64,
-    file_hash: &str,
-    overwrite: bool,
-    dry_run: bool,
-) -> Result<ControlMessage> {
-    let (final_path, part_path) = storage::build_target_paths(destination_path, relative_path)?;
-
-    if let Some(parent) = final_path.parent() {
-        if !dry_run {
-            fs::create_dir_all(parent).await?;
-        }
-    }
-
-    if final_path.exists() {
-        if !overwrite {
-            return Ok(ControlMessage::UploadReady {
-                status: PrepareStatus::Conflict,
-                offset: 0,
-                partial_hash: None,
-                message: Some(format!(
-                    "target file exists and overwrite disabled: {}",
-                    final_path.display()
-                )),
-            });
-        }
-        // AlreadyExists check only if client provided a hash (non-streaming mode)
-        if !file_hash.is_empty() && fs::metadata(&final_path).await?.len() == file_size {
-            let existing_hash = util::hash_file(&final_path).await?;
-            if existing_hash == file_hash {
-                return Ok(ControlMessage::UploadReady {
-                    status: PrepareStatus::AlreadyExists,
-                    offset: file_size,
-                    partial_hash: None,
-                    message: Some("matching target file already exists".to_string()),
-                });
-            }
-        }
-    }
-
-    if dry_run {
-        return Ok(ControlMessage::UploadReady {
-            status: PrepareStatus::Ready,
-            offset: 0,
-            partial_hash: None,
-            message: Some("dry-run mode".to_string()),
-        });
-    }
-
-    if !part_path.exists() {
-        let _ = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&part_path)
-            .await?;
-    }
-
-    let mut offset = fs::metadata(&part_path).await?.len();
-    if offset > file_size {
-        let file = OpenOptions::new().write(true).open(&part_path).await?;
-        file.set_len(0).await?;
-        offset = 0;
-    }
-
-    let partial_hash = if offset > 0 {
-        Some(util::hash_file_prefix_exact(&part_path, offset).await?)
-    } else {
-        None
-    };
-
-    Ok(ControlMessage::UploadReady {
-        status: PrepareStatus::Ready,
-        offset,
-        partial_hash,
-        message: None,
-    })
-}
-
-async fn receive_transfer(
-    stream: &mut TcpStream,
-    part_path: &Path,
-    final_path: &Path,
-    file_size: u64,
-    offset: u64,
-    file_hash: &str,
-    overwrite: bool,
-    mtime_secs: i64,
-) -> Result<(u64, String, bool)> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(part_path)
-        .await?;
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
-    let mut file = BufWriter::with_capacity(4 * 1024 * 1024, file);
-
-    let mut remaining = file_size.saturating_sub(offset);
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
-    while remaining > 0 {
-        let to_read = cmp::min(remaining as usize, buf.len());
-        stream
-            .read_exact(&mut buf[..to_read])
-            .await
-            .map_err(|e| anyhow!("transfer read error: {e}"))?;
-        file.write_all(&buf[..to_read]).await?;
-        remaining -= to_read as u64;
-    }
-    file.flush().await?;
-
-    let final_hash = util::hash_file(part_path).await?;
-    // If file_hash is empty (stream-hash mode), client will verify.
-    // Always finalize the file — client does the comparison.
-    let verified = if file_hash.is_empty() {
-        true // stream mode: server trusts transfer, client verifies hash
-    } else {
-        final_hash == file_hash
-    };
-    if verified {
-        if overwrite && final_path.exists() {
-            let _ = fs::remove_file(final_path).await;
-        }
-        fs::rename(part_path, final_path).await?;
-        let _ = util::set_mtime(final_path, mtime_secs).await;
-    }
-
-    Ok((file_size, final_hash, verified))
 }

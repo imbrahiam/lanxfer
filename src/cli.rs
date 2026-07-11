@@ -11,6 +11,9 @@ use crate::protocol::{DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT};
     long_about = "Fast resumable LAN file transfer CLI.\n\nRun with no arguments to enter peer mode: a background receiver starts, other peers on the LAN are auto-discovered, and you can pick one and send."
 )]
 pub struct Cli {
+    /// Peer mode without a pairing code — anyone on the network can send to you.
+    #[arg(long)]
+    pub open: bool,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -34,6 +37,9 @@ pub enum Command {
         discovery_port: u16,
         #[arg(long)]
         pairing_code: Option<String>,
+        /// Accept transfers without a pairing code (trusted networks only).
+        #[arg(long)]
+        open: bool,
     },
     /// Discover receivers across all network interfaces.
     Discover {

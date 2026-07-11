@@ -1,18 +1,18 @@
 use anyhow::{Result, anyhow, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
 use crate::discovery;
 use crate::protocol::{
-    ControlMessage, PROTOCOL_VERSION, PrepareStatus, read_control, send_control,
+    ControlMessage, DirSpec, FileSpec, PROTOCOL_VERSION, PlanAction, read_control, send_control,
 };
 use crate::ui;
 use crate::util;
@@ -31,17 +31,527 @@ pub(crate) struct FileEntry {
     pub mtime_secs: i64,
 }
 
-#[derive(Debug)]
-enum FileTransferStatus {
-    Transferred,
-    AlreadyExists,
-    Conflict,
-}
-
 pub(crate) struct ScanResult {
     pub directories: Vec<DirectoryEntry>,
     pub files: Vec<FileEntry>,
-    pub total_bytes: u64,
+}
+
+pub struct SendOptions {
+    pub overwrite: bool,
+    pub dry_run: bool,
+    pub jobs: Option<usize>,
+    pub show_progress: bool,
+}
+
+#[derive(Default)]
+pub struct SendSummary {
+    pub transferred: usize,
+    pub skipped_up_to_date: usize,
+    pub conflicts: usize,
+    pub bytes: u64,
+    pub errors: Vec<String>,
+}
+
+/// One transfer unit pulled by data workers: a whole plain file, or one
+/// 64 MiB stripe of a large file.
+#[derive(Clone)]
+struct Unit {
+    id: u32,
+    offset: u64,
+    len: u64,
+    stripe: Option<u32>,
+}
+
+/// v3 session engine: one manifest round-trip, then persistent data
+/// connections streaming units back-to-back. Large files are striped across
+/// connections; BLAKE3 subtree CVs are merged for whole-file verification.
+pub async fn send_session(
+    target: &str,
+    port: u16,
+    sources: &[PathBuf],
+    destination: &str,
+    auth_code: Option<&str>,
+    opts: SendOptions,
+) -> Result<SendSummary> {
+    // Scan all sources into one manifest.
+    let mut files: Vec<FileEntry> = Vec::new();
+    let mut dirs: Vec<DirectoryEntry> = Vec::new();
+    for source in sources {
+        let source = fs::canonicalize(source).await?;
+        let scan = scan_source(&source).await?;
+        files.extend(scan.files);
+        dirs.extend(scan.directories);
+    }
+    if files.is_empty() && dirs.is_empty() {
+        bail!("sources have no transferable entries");
+    }
+
+    let specs: Vec<FileSpec> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| FileSpec {
+            id: i as u32,
+            rel_path: f.relative_path.clone(),
+            size: f.size,
+            mtime_secs: f.mtime_secs,
+        })
+        .collect();
+    let dir_specs: Vec<DirSpec> = dirs
+        .iter()
+        .map(|d| DirSpec {
+            rel_path: d.relative_path.clone(),
+            mtime_secs: d.mtime_secs,
+        })
+        .collect();
+
+    // Control connection: manifest -> plan.
+    let (mut control, _device) = connect_and_handshake(target, port).await?;
+    send_control(
+        &mut control,
+        &ControlMessage::BeginSession {
+            destination_path: destination.to_string(),
+            auth_code: auth_code.map(ToString::to_string),
+            overwrite: opts.overwrite,
+            dry_run: opts.dry_run,
+            files: specs,
+            dirs: dir_specs,
+        },
+    )
+    .await?;
+    let (session_id, plan) = match read_control(&mut control).await? {
+        ControlMessage::SessionPlan {
+            session_id,
+            actions,
+        } => (session_id, actions),
+        ControlMessage::Error { message } => bail!("{message}"),
+        other => bail!("unexpected plan response: {other:?}"),
+    };
+    let mut actions: HashMap<u32, PlanAction> =
+        plan.into_iter().map(|a| (a.id, a.action)).collect();
+
+    if opts.dry_run {
+        return Ok(print_dry_run(&files, &actions));
+    }
+
+    // Resume verification: hash local prefixes; on mismatch tell the server
+    // to restart that file from zero.
+    let mut hashers: HashMap<u32, blake3::Hasher> = HashMap::new();
+    for (id, file) in files.iter().enumerate() {
+        let id = id as u32;
+        let Some(PlanAction::Resume {
+            offset,
+            partial_hash,
+        }) = actions.get(&id).cloned()
+        else {
+            continue;
+        };
+        let matches = if offset > file.size {
+            false
+        } else {
+            match util::hash_prefix_hasher(&file.abs_path, offset).await {
+                Ok(h) if h.clone().finalize().to_hex().to_string() == partial_hash => {
+                    hashers.insert(id, h);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !matches {
+            send_control(&mut control, &ControlMessage::RestartFile { id }).await?;
+            loop {
+                match read_control(&mut control).await? {
+                    ControlMessage::RestartAck { id: acked } if acked == id => break,
+                    ControlMessage::Error { message } => bail!("restart failed: {message}"),
+                    _ => continue,
+                }
+            }
+            actions.insert(id, PlanAction::Send);
+        }
+    }
+
+    // Build the unit queue.
+    let mut queue: VecDeque<Unit> = VecDeque::new();
+    let mut expected_dones = 0usize;
+    let mut total_bytes_to_send = 0u64;
+    let mut summary = SendSummary::default();
+    for (id, file) in files.iter().enumerate() {
+        let id = id as u32;
+        match actions.get(&id) {
+            Some(PlanAction::SkipUpToDate) => summary.skipped_up_to_date += 1,
+            Some(PlanAction::Conflict) => summary.conflicts += 1,
+            Some(PlanAction::Send) => {
+                expected_dones += 1;
+                if util::is_striped(file.size) {
+                    for i in 0..util::stripe_count(file.size) {
+                        let (offset, len) = util::stripe_range(file.size, i);
+                        total_bytes_to_send += len;
+                        queue.push_back(Unit {
+                            id,
+                            offset,
+                            len,
+                            stripe: Some(i),
+                        });
+                    }
+                } else {
+                    total_bytes_to_send += file.size;
+                    queue.push_back(Unit {
+                        id,
+                        offset: 0,
+                        len: file.size,
+                        stripe: None,
+                    });
+                }
+            }
+            Some(PlanAction::Resume { offset, .. }) => {
+                expected_dones += 1;
+                let len = file.size - offset;
+                total_bytes_to_send += len;
+                queue.push_back(Unit {
+                    id,
+                    offset: *offset,
+                    len,
+                    stripe: None,
+                });
+            }
+            None => summary.errors.push(format!(
+                "{}: server plan missing this file",
+                file.relative_path
+            )),
+        }
+    }
+
+    let file_count = expected_dones;
+    let worker_count = opts
+        .jobs
+        .unwrap_or_else(|| default_jobs(queue.len()))
+        .max(1);
+
+    let multi = if opts.show_progress {
+        Some(MultiProgress::new())
+    } else {
+        None
+    };
+    let overall = multi.as_ref().map(|m| {
+        let bar = m.add(ProgressBar::new(total_bytes_to_send));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template(ui::overall_bar_template())
+                .unwrap()
+                .progress_chars(ui::progress_chars()),
+        );
+        bar.set_message(ui::dim(&format!("0/{file_count} files")));
+        bar
+    });
+
+    // Shared state between workers and the control reader.
+    let files = Arc::new(files);
+    let queue = Arc::new(Mutex::new(queue));
+    let hashers = Arc::new(Mutex::new(hashers));
+    let client_hashes: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let stripe_cvs: Arc<Mutex<HashMap<u32, HashMap<u32, util::StripeCv>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let sent_bytes = Arc::new(AtomicU64::new(0));
+
+    // Control reader collects FileDone results while workers stream.
+    let done_overall = overall.clone();
+    let control_task = tokio::spawn(async move {
+        let mut dones: HashMap<u32, (String, bool, Option<String>)> = HashMap::new();
+        while dones.len() < expected_dones {
+            match read_control(&mut control).await {
+                Ok(ControlMessage::FileDone {
+                    id,
+                    hash,
+                    ok,
+                    error,
+                }) => {
+                    dones.insert(id, (hash, ok, error));
+                    if let Some(bar) = &done_overall {
+                        bar.set_message(ui::dim(&format!("{}/{file_count} files", dones.len())));
+                    }
+                }
+                Ok(ControlMessage::Error { message }) => {
+                    return (dones, Some(message));
+                }
+                Ok(_) => continue,
+                Err(err) => return (dones, Some(err.to_string())),
+            }
+        }
+        (dones, None)
+    });
+
+    let mut workers = JoinSet::new();
+    for _ in 0..worker_count {
+        let target = target.to_string();
+        let session_id = session_id.clone();
+        let files = Arc::clone(&files);
+        let queue = Arc::clone(&queue);
+        let hashers = Arc::clone(&hashers);
+        let client_hashes = Arc::clone(&client_hashes);
+        let stripe_cvs = Arc::clone(&stripe_cvs);
+        let sent_bytes = Arc::clone(&sent_bytes);
+        let multi = multi.clone();
+        let overall = overall.clone();
+        workers.spawn(async move {
+            run_worker(
+                &target,
+                port,
+                &session_id,
+                files,
+                queue,
+                hashers,
+                client_hashes,
+                stripe_cvs,
+                sent_bytes,
+                multi,
+                overall,
+            )
+            .await
+        });
+    }
+
+    let mut worker_errors = Vec::new();
+    while let Some(res) = workers.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => worker_errors.push(err.to_string()),
+            Err(err) => worker_errors.push(format!("worker panicked: {err}")),
+        }
+    }
+
+    // Wait for the server's completion reports. If a worker died, some
+    // FileDones will never come — bounded wait, then report.
+    let (dones, control_err) = if worker_errors.is_empty() {
+        control_task
+            .await
+            .map_err(|e| anyhow!("control reader: {e}"))?
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), control_task).await {
+            Ok(joined) => joined.map_err(|e| anyhow!("control reader: {e}"))?,
+            Err(_) => (HashMap::new(), Some("timed out waiting for results".into())),
+        }
+    };
+
+    if let Some(bar) = &overall {
+        bar.finish_with_message(ui::ok("done"));
+    }
+
+    summary.errors.extend(worker_errors);
+    if let Some(err) = control_err {
+        summary.errors.push(err);
+    }
+
+    // Reconcile: server hash must equal our locally computed hash.
+    let client_hashes = client_hashes.lock().unwrap();
+    let stripe_cvs = stripe_cvs.lock().unwrap();
+    for (id, file) in files.iter().enumerate() {
+        let id = id as u32;
+        let needs_done = matches!(
+            actions.get(&id),
+            Some(PlanAction::Send) | Some(PlanAction::Resume { .. })
+        );
+        if !needs_done {
+            continue;
+        }
+        let local_hash = if util::is_striped(file.size) {
+            stripe_cvs.get(&id).and_then(|cvs| {
+                let count = util::stripe_count(file.size);
+                let ordered: Option<Vec<util::StripeCv>> =
+                    (0..count).map(|i| cvs.get(&i).copied()).collect();
+                ordered.map(|cvs| util::merge_stripes(&cvs, file.size).to_hex().to_string())
+            })
+        } else {
+            client_hashes.get(&id).cloned()
+        };
+        match (dones.get(&id), local_hash) {
+            (Some((server_hash, true, _)), Some(local)) if *server_hash == local => {
+                summary.transferred += 1;
+            }
+            (Some((server_hash, true, _)), Some(local)) => summary.errors.push(format!(
+                "{}: hash mismatch (local {local}, remote {server_hash})",
+                file.relative_path
+            )),
+            (Some((_, false, error)), _) => summary.errors.push(format!(
+                "{}: {}",
+                file.relative_path,
+                error.clone().unwrap_or_else(|| "receive failed".into())
+            )),
+            (None, _) => summary.errors.push(format!(
+                "{}: no completion report from receiver",
+                file.relative_path
+            )),
+            (_, None) => summary
+                .errors
+                .push(format!("{}: transfer incomplete", file.relative_path)),
+        }
+    }
+    summary.bytes = sent_bytes.load(Ordering::Relaxed);
+
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_worker(
+    target: &str,
+    port: u16,
+    session_id: &str,
+    files: Arc<Vec<FileEntry>>,
+    queue: Arc<Mutex<VecDeque<Unit>>>,
+    hashers: Arc<Mutex<HashMap<u32, blake3::Hasher>>>,
+    client_hashes: Arc<Mutex<HashMap<u32, String>>>,
+    stripe_cvs: Arc<Mutex<HashMap<u32, HashMap<u32, util::StripeCv>>>>,
+    sent_bytes: Arc<AtomicU64>,
+    multi: Option<MultiProgress>,
+    overall: Option<ProgressBar>,
+) -> Result<()> {
+    // Don't open a connection if there's no work left.
+    if queue.lock().unwrap().is_empty() {
+        return Ok(());
+    }
+
+    let (mut stream, _) = connect_and_handshake(target, port).await?;
+    send_control(
+        &mut stream,
+        &ControlMessage::JoinSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
+    match read_control(&mut stream).await? {
+        ControlMessage::JoinAck => {}
+        ControlMessage::Error { message } => bail!("{message}"),
+        other => bail!("unexpected join response: {other:?}"),
+    }
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stream);
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+
+    loop {
+        let unit = match queue.lock().unwrap().pop_front() {
+            Some(u) => u,
+            None => break,
+        };
+        let entry = &files[unit.id as usize];
+
+        let bar = multi.as_ref().map(|m| {
+            let bar = m.add(ProgressBar::new(unit.len));
+            bar.set_style(
+                ProgressStyle::default_bar()
+                    .template(ui::unit_bar_template())
+                    .unwrap()
+                    .progress_chars(ui::progress_chars()),
+            );
+            let label = match unit.stripe {
+                Some(i) => format!("{} [{}]", entry.relative_path, i),
+                None => entry.relative_path.clone(),
+            };
+            bar.set_prefix(label);
+            bar
+        });
+
+        send_control(
+            &mut writer,
+            &ControlMessage::SendFile {
+                id: unit.id,
+                offset: unit.offset,
+                len: unit.len,
+            },
+        )
+        .await?;
+
+        // Hasher: stripes hash independently as BLAKE3 subtrees; plain files
+        // use one streaming hasher (pre-seeded with the prefix on resume).
+        let mut hasher = match unit.stripe {
+            Some(i) => util::stripe_hasher(i),
+            None => hashers.lock().unwrap().remove(&unit.id).unwrap_or_default(),
+        };
+
+        let mut file = fs::File::open(&entry.abs_path).await?;
+        file.seek(std::io::SeekFrom::Start(unit.offset)).await?;
+        let mut remaining = unit.len;
+        while remaining > 0 {
+            let cap = usize::min(remaining as usize, buf.len());
+            let read = file.read(&mut buf[..cap]).await?;
+            if read == 0 {
+                bail!(
+                    "{}: file became shorter during transfer",
+                    entry.relative_path
+                );
+            }
+            hasher.update(&buf[..read]);
+            writer.write_all(&buf[..read]).await?;
+            remaining -= read as u64;
+            sent_bytes.fetch_add(read as u64, Ordering::Relaxed);
+            if let Some(b) = &bar {
+                b.inc(read as u64);
+            }
+            if let Some(b) = &overall {
+                b.inc(read as u64);
+            }
+        }
+        writer.flush().await?;
+
+        match unit.stripe {
+            Some(i) => {
+                stripe_cvs
+                    .lock()
+                    .unwrap()
+                    .entry(unit.id)
+                    .or_default()
+                    .insert(i, util::finish_stripe(&hasher));
+            }
+            None => {
+                client_hashes
+                    .lock()
+                    .unwrap()
+                    .insert(unit.id, hasher.finalize().to_hex().to_string());
+            }
+        }
+        if let Some(b) = bar {
+            b.finish_and_clear();
+        }
+    }
+
+    writer.flush().await?;
+    Ok(())
+}
+
+fn print_dry_run(files: &[FileEntry], actions: &HashMap<u32, PlanAction>) -> SendSummary {
+    let mut summary = SendSummary::default();
+    let mut send_bytes = 0u64;
+    ui::section("Plan (dry run)");
+    for (id, file) in files.iter().enumerate() {
+        match actions.get(&(id as u32)) {
+            Some(PlanAction::Send) => {
+                summary.transferred += 1;
+                send_bytes += file.size;
+            }
+            Some(PlanAction::Resume { offset, .. }) => {
+                summary.transferred += 1;
+                send_bytes += file.size - offset;
+                ui::info(&format!(
+                    "resume {} from {}",
+                    file.relative_path,
+                    util::format_size(*offset)
+                ));
+            }
+            Some(PlanAction::SkipUpToDate) => summary.skipped_up_to_date += 1,
+            Some(PlanAction::Conflict) => {
+                summary.conflicts += 1;
+                ui::warn(&format!("conflict: {} exists", file.relative_path));
+            }
+            None => {}
+        }
+    }
+    ui::kv(
+        "would send",
+        &format!(
+            "{} files ({})",
+            summary.transferred,
+            util::format_size(send_bytes)
+        ),
+    );
+    ui::kv("up to date", &summary.skipped_up_to_date.to_string());
+    ui::kv("conflicts", &summary.conflicts.to_string());
+    summary
 }
 
 pub async fn discover(discovery_port: u16, timeout_ms: u64) -> Result<()> {
@@ -76,7 +586,13 @@ pub async fn discover(discovery_port: u16, timeout_ms: u64) -> Result<()> {
         } else {
             ui::dim("off")
         };
-        println!("  {}  {}  {}  {}", ui::bold(&host_pad), endpoint_pad, platform_pad, auth);
+        println!(
+            "  {}  {}  {}  {}",
+            ui::bold(&host_pad),
+            endpoint_pad,
+            platform_pad,
+            auth
+        );
     }
     Ok(())
 }
@@ -102,7 +618,10 @@ pub async fn connect_interactive(
 
     if hosts.len() == 1 {
         let host = &hosts[0];
-        ui::success(&format!("found single receiver {}", ui::bold(&host.reply.host)));
+        ui::success(&format!(
+            "found single receiver {}",
+            ui::bold(&host.reply.host)
+        ));
         connect_and_list_destinations(&host.ip, host.reply.control_port).await?;
         return Ok(());
     }
@@ -119,7 +638,11 @@ pub async fn connect_interactive(
                 host.reply.control_port,
                 host.reply.device.os,
                 host.reply.device.arch,
-                if host.reply.auth_required { "required" } else { "off" },
+                if host.reply.auth_required {
+                    "required"
+                } else {
+                    "off"
+                },
             )),
         );
     }
@@ -179,25 +702,7 @@ async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
 }
 
 pub async fn print_destinations(target: &str, port: u16) -> Result<()> {
-    let (mut stream, device) = connect_and_handshake(target, port).await?;
-    ui::success(&format!(
-        "connected to {} ({} {}, protocol {})",
-        ui::bold(&device.host_name),
-        device.os,
-        device.arch,
-        device.protocol_version
-    ));
-    send_control(&mut stream, &ControlMessage::ListDestinations).await?;
-    let reply = read_control(&mut stream).await?;
-
-    match reply {
-        ControlMessage::Destinations { items } => {
-            print_destination_table(&items);
-            Ok(())
-        }
-        ControlMessage::Error { message } => bail!("{message}"),
-        other => bail!("unexpected server response: {other:?}"),
-    }
+    connect_and_list_destinations(target, port).await
 }
 
 fn print_destination_table(items: &[crate::protocol::DestinationInfo]) {
@@ -220,6 +725,8 @@ fn print_destination_table(items: &[crate::protocol::DestinationInfo]) {
     }
 }
 
+/// Direct `lanxfer send` entry point — wraps the session engine.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_path(
     target: &str,
     port: u16,
@@ -231,343 +738,40 @@ pub async fn send_path(
     jobs: Option<usize>,
     show_progress: bool,
 ) -> Result<()> {
-    let source = fs::canonicalize(source).await?;
-    let scan = scan_source(&source).await?;
-    if scan.files.is_empty() && scan.directories.is_empty() {
-        bail!("source has no transferable entries");
-    }
-
-    let worker_count = jobs.unwrap_or_else(|| default_jobs(scan.files.len()));
-    ui::section("Plan");
-    ui::kv("files", &scan.files.len().to_string());
-    ui::kv("directories", &scan.directories.len().to_string());
-    ui::kv("size", &util::format_size(scan.total_bytes));
-    ui::kv("workers", &worker_count.to_string());
-    if dry_run {
-        ui::warn("dry-run mode — no files will be written");
-    }
-
-    let (stream, device) = connect_and_handshake(target, port).await?;
-    drop(stream);
-    ui::success(&format!(
-        "target {} ({} {}, protocol {})",
-        ui::bold(&device.host_name),
-        device.os,
-        device.arch,
-        device.protocol_version
-    ));
-
-    create_directories(
+    let summary = send_session(
         target,
         port,
-        destination,
+        &[source.to_path_buf()],
+        &destination.to_string_lossy(),
         auth_code,
-        dry_run,
-        &scan.directories,
+        SendOptions {
+            overwrite,
+            dry_run,
+            jobs,
+            show_progress,
+        },
     )
     .await?;
 
-    let total_bytes = scan.total_bytes;
-    let transferred_bytes = Arc::new(AtomicU64::new(0));
-    let done_files = Arc::new(AtomicUsize::new(0));
-
-    let multi = if show_progress && !dry_run {
-        Some(MultiProgress::new())
-    } else {
-        None
-    };
-    let overall_bar = multi.as_ref().map(|m| {
-        let bar = m.add(ProgressBar::new(total_bytes));
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "  {spinner:.cyan} [{bar:36.cyan/blue}] {bytes:>10}/{total_bytes:<10} {binary_bytes_per_sec:>11} eta {eta:<5} {msg}",
-                )
-                .unwrap()
-                .progress_chars("█▉▊▋▌▍▎▏ "),
-        );
-        bar.set_message(ui::dim(&format!("0/{} files", scan.files.len())));
-        bar
-    });
-
-    let semaphore = Arc::new(Semaphore::new(worker_count.max(1)));
-    let mut set = JoinSet::new();
-    let file_count = scan.files.len();
-    for entry in scan.files {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let target = target.to_string();
-        let destination = destination.to_string_lossy().to_string();
-        let auth_code = auth_code.map(ToString::to_string);
-        let transferred = Arc::clone(&transferred_bytes);
-        let done = Arc::clone(&done_files);
-        let file_bar = multi.as_ref().map(|m| {
-            let bar = m.add(ProgressBar::new(entry.size));
-            bar.set_style(
-                ProgressStyle::default_bar()
-                    .template("    {prefix:.dim} [{bar:28.green/black}] {bytes}/{total_bytes}")
-                    .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏ "),
-            );
-            bar.set_prefix(entry.relative_path.clone());
-            bar
-        });
-        let overall = overall_bar.clone();
-        let fc = file_count;
-
-        set.spawn(async move {
-            let _permit = permit;
-            let result = transfer_one_file(
-                &target,
-                port,
-                &destination,
-                auth_code.as_deref(),
-                overwrite,
-                dry_run,
-                &entry,
-                &transferred,
-                file_bar.as_ref(),
-                overall.as_ref(),
-            )
-            .await;
-            done.fetch_add(1, Ordering::Relaxed);
-            if let Some(fb) = &file_bar {
-                fb.finish_and_clear();
-            }
-            if let Some(ob) = &overall {
-                ob.set_message(ui::dim(&format!(
-                    "{}/{} files",
-                    done.load(Ordering::Relaxed),
-                    fc
-                )));
-            }
-            result
-        });
+    if dry_run {
+        return Ok(());
     }
-
-    let mut transferred_files = 0usize;
-    let mut skipped_existing = 0usize;
-    let mut conflicts = 0usize;
-    let mut errors = Vec::new();
-    while let Some(task) = set.join_next().await {
-        match task {
-            Ok(Ok(FileTransferStatus::Transferred)) => transferred_files += 1,
-            Ok(Ok(FileTransferStatus::AlreadyExists)) => skipped_existing += 1,
-            Ok(Ok(FileTransferStatus::Conflict)) => conflicts += 1,
-            Ok(Err(err)) => errors.push(err.to_string()),
-            Err(err) => errors.push(format!("worker join error: {err}")),
-        }
-    }
-
-    if let Some(ob) = &overall_bar {
-        ob.finish_with_message(ui::ok("done"));
-    }
-
     println!();
-    ui::kv("transferred", &transferred_files.to_string());
-    if skipped_existing > 0 {
-        ui::kv("skipped", &skipped_existing.to_string());
+    ui::kv("transferred", &summary.transferred.to_string());
+    if summary.skipped_up_to_date > 0 {
+        ui::kv("up to date", &summary.skipped_up_to_date.to_string());
     }
-    if conflicts > 0 {
-        ui::kv("conflicts", &conflicts.to_string());
+    if summary.conflicts > 0 {
+        ui::kv("conflicts", &summary.conflicts.to_string());
     }
-    if !errors.is_empty() {
-        ui::kv("errors", &errors.len().to_string());
-        for err in errors {
-            ui::error(&err);
+    if !summary.errors.is_empty() {
+        ui::kv("errors", &summary.errors.len().to_string());
+        for err in &summary.errors {
+            ui::error(err);
         }
         bail!("one or more file transfers failed");
     }
     Ok(())
-}
-
-async fn create_directories(
-    target: &str,
-    port: u16,
-    destination: &Path,
-    auth_code: Option<&str>,
-    dry_run: bool,
-    directories: &[DirectoryEntry],
-) -> Result<()> {
-    if directories.is_empty() {
-        return Ok(());
-    }
-
-    let mut stream = connect_and_handshake(target, port).await?.0;
-    for dir in directories {
-        send_control(
-            &mut stream,
-            &ControlMessage::CreateDirectory {
-                destination_path: destination.to_string_lossy().to_string(),
-                relative_path: dir.relative_path.clone(),
-                mtime_secs: dir.mtime_secs,
-                auth_code: auth_code.map(ToString::to_string),
-                dry_run,
-            },
-        )
-        .await?;
-        match read_control(&mut stream).await? {
-            ControlMessage::DirectoryCreated { .. } => {}
-            ControlMessage::Error { message } => bail!("{message}"),
-            other => bail!("unexpected create directory response: {other:?}"),
-        }
-    }
-    Ok(())
-}
-
-async fn transfer_one_file(
-    target: &str,
-    port: u16,
-    destination_path: &str,
-    auth_code: Option<&str>,
-    overwrite: bool,
-    dry_run: bool,
-    file: &FileEntry,
-    transferred_total: &Arc<AtomicU64>,
-    file_bar: Option<&ProgressBar>,
-    overall_bar: Option<&ProgressBar>,
-) -> Result<FileTransferStatus> {
-    // Stream-hash mode: no pre-hash, hash while sending (single disk read)
-    let mut stream = connect_and_handshake(target, port).await?.0;
-
-    send_control(
-        &mut stream,
-        &ControlMessage::PrepareUpload {
-            destination_path: destination_path.to_string(),
-            relative_path: file.relative_path.clone(),
-            file_size: file.size,
-            file_hash: String::new(), // empty = stream-hash mode
-            mtime_secs: file.mtime_secs,
-            overwrite,
-            auth_code: auth_code.map(ToString::to_string),
-            dry_run,
-        },
-    )
-    .await?;
-
-    let mut ready = match read_control(&mut stream).await? {
-        ControlMessage::UploadReady {
-            status,
-            offset,
-            partial_hash,
-            message: _,
-        } => UploadReady {
-            status,
-            offset,
-            partial_hash,
-        },
-        ControlMessage::Error { message } => bail!("{message}"),
-        other => bail!("unexpected upload response: {other:?}"),
-    };
-
-    match ready.status {
-        PrepareStatus::AlreadyExists => return Ok(FileTransferStatus::AlreadyExists),
-        PrepareStatus::Conflict => return Ok(FileTransferStatus::Conflict),
-        PrepareStatus::Ready => {}
-    }
-
-    if dry_run {
-        return Ok(FileTransferStatus::Transferred);
-    }
-
-    // For resume: verify prefix hash if server has partial data
-    if ready.offset > 0 {
-        let local_prefix = util::hash_file_prefix_exact(&file.abs_path, ready.offset).await?;
-        if ready.partial_hash.as_deref() != Some(local_prefix.as_str()) {
-            send_control(
-                &mut stream,
-                &ControlMessage::RestartUpload {
-                    destination_path: destination_path.to_string(),
-                    relative_path: file.relative_path.clone(),
-                    auth_code: auth_code.map(ToString::to_string),
-                },
-            )
-            .await?;
-            ready = match read_control(&mut stream).await? {
-                ControlMessage::UploadReady {
-                    status,
-                    offset,
-                    partial_hash,
-                    message: _,
-                } => UploadReady {
-                    status,
-                    offset,
-                    partial_hash,
-                },
-                ControlMessage::Error { message } => bail!("{message}"),
-                other => bail!("unexpected restart response: {other:?}"),
-            };
-            if !matches!(ready.status, PrepareStatus::Ready) {
-                bail!("restart did not return ready state");
-            }
-        }
-    }
-
-    send_control(
-        &mut stream,
-        &ControlMessage::BeginUpload {
-            destination_path: destination_path.to_string(),
-            relative_path: file.relative_path.clone(),
-            offset: ready.offset,
-            file_size: file.size,
-            file_hash: String::new(), // computed after sending
-            mtime_secs: file.mtime_secs,
-            overwrite,
-            auth_code: auth_code.map(ToString::to_string),
-            dry_run: false,
-        },
-    )
-    .await?;
-
-    match read_control(&mut stream).await? {
-        ControlMessage::BeginAck { offset } if offset == ready.offset => {}
-        ControlMessage::Error { message } => bail!("{message}"),
-        other => bail!("unexpected begin response: {other:?}"),
-    }
-
-    // Hash while sending — single disk read
-    let client_hash = transmit_payload(
-        &mut stream,
-        &file.abs_path,
-        file.size,
-        ready.offset,
-        transferred_total,
-        file_bar,
-        overall_bar,
-    )
-    .await?;
-
-    match read_control(&mut stream).await? {
-        ControlMessage::TransferResult {
-            verified,
-            final_hash,
-            error,
-            ..
-        } => {
-            // Server computed its own hash — verify against ours
-            if verified && final_hash == client_hash {
-                Ok(FileTransferStatus::Transferred)
-            } else if !final_hash.is_empty() && final_hash == client_hash {
-                // Server didn't have pre-hash to compare but hashes match
-                Ok(FileTransferStatus::Transferred)
-            } else {
-                bail!(
-                    "{}",
-                    error.unwrap_or_else(|| format!(
-                        "hash mismatch: client={} server={}",
-                        client_hash, final_hash
-                    ))
-                )
-            }
-        }
-        ControlMessage::Error { message } => bail!("{message}"),
-        other => bail!("unexpected transfer result: {other:?}"),
-    }
-}
-
-struct UploadReady {
-    status: PrepareStatus,
-    offset: u64,
-    partial_hash: Option<String>,
 }
 
 pub(crate) async fn connect_and_handshake(
@@ -602,71 +806,10 @@ pub(crate) async fn connect_and_handshake(
     }
 }
 
-/// Transmit file data while computing BLAKE3 hash. Returns the full-file hash.
-/// Hashes the entire file (including any prefix before offset) for complete verification.
-async fn transmit_payload(
-    stream: &mut TcpStream,
-    source: &Path,
-    file_size: u64,
-    offset: u64,
-    transferred_total: &Arc<AtomicU64>,
-    file_bar: Option<&ProgressBar>,
-    overall_bar: Option<&ProgressBar>,
-) -> Result<String> {
-    let source = source.to_path_buf();
-    let file = fs::File::open(&source).await?;
-    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stream);
-    let mut hasher = blake3::Hasher::new();
-
-    if let Some(fb) = file_bar {
-        fb.set_position(offset);
-    }
-
-    // Read-and-hash prefix once to avoid a second full-file disk pass on resume.
-    let mut hashed_prefix = 0u64;
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
-    while hashed_prefix < offset {
-        let remaining = (offset - hashed_prefix) as usize;
-        let cap = usize::min(remaining, buf.len());
-        let read = reader.read(&mut buf[..cap]).await?;
-        if read == 0 {
-            bail!("source file became shorter before resume offset");
-        }
-        hasher.update(&buf[..read]);
-        hashed_prefix += read as u64;
-    }
-
-    let to_send = file_size.saturating_sub(offset);
-    let mut sent = 0u64;
-    while sent < to_send {
-        let remaining = (to_send - sent) as usize;
-        let cap = usize::min(remaining, buf.len());
-        let read = reader.read(&mut buf[..cap]).await?;
-        if read == 0 {
-            bail!("source file became shorter during transfer");
-        }
-        hasher.update(&buf[..read]);
-        writer.write_all(&buf[..read]).await?;
-        sent += read as u64;
-        transferred_total.fetch_add(read as u64, Ordering::Relaxed);
-        if let Some(fb) = file_bar {
-            fb.inc(read as u64);
-        }
-        if let Some(ob) = overall_bar {
-            ob.inc(read as u64);
-        }
-    }
-    writer.flush().await?;
-
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
 pub(crate) async fn scan_source(source: &Path) -> Result<ScanResult> {
     let meta = fs::metadata(source).await?;
     let mut directories = Vec::new();
     let mut files = Vec::new();
-    let mut total_bytes = 0u64;
 
     if meta.is_file() {
         let name = source
@@ -680,12 +823,7 @@ pub(crate) async fn scan_source(source: &Path) -> Result<ScanResult> {
             size: meta.len(),
             mtime_secs: meta.modified().map(util::system_time_secs).unwrap_or(0),
         });
-        total_bytes = meta.len();
-        return Ok(ScanResult {
-            directories,
-            files,
-            total_bytes,
-        });
+        return Ok(ScanResult { directories, files });
     }
 
     if !meta.is_dir() {
@@ -714,7 +852,6 @@ pub(crate) async fn scan_source(source: &Path) -> Result<ScanResult> {
 
         if metadata.is_file() {
             let size = metadata.len();
-            total_bytes += size;
             let mtime_secs = metadata.modified().map(util::system_time_secs).unwrap_or(0);
             files.push(FileEntry {
                 abs_path: path.to_path_buf(),
@@ -728,11 +865,7 @@ pub(crate) async fn scan_source(source: &Path) -> Result<ScanResult> {
     directories.sort_by_key(|d| d.relative_path.matches('/').count());
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
-    Ok(ScanResult {
-        directories,
-        files,
-        total_bytes,
-    })
+    Ok(ScanResult { directories, files })
 }
 
 fn path_to_slash_string(path: &Path) -> Result<String> {
@@ -756,12 +889,12 @@ fn tune_socket(stream: &TcpStream) {
     let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
 }
 
-fn default_jobs(file_count: usize) -> usize {
-    if file_count <= 1 {
+fn default_jobs(unit_count: usize) -> usize {
+    if unit_count <= 1 {
         return 1;
     }
     let cpu = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(4);
-    usize::min(file_count, usize::min(8, usize::max(2, cpu)))
+    usize::min(unit_count, usize::min(8, usize::max(2, cpu)))
 }

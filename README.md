@@ -59,6 +59,15 @@ lanxfer
 
 Each peer starts a background receiver, shows its own pairing code, and lists the other peers it discovers on the LAN. Pick a peer, enter its code (shown on its screen), browse, send. Done.
 
+Once connected you stay in a session with that peer: send more files, reuse the last destination, view the list of transfers so far — no rescanning or re-entering the code between sends.
+
+On a trusted network you can skip pairing codes entirely:
+
+```bash
+lanxfer --open        # peer mode, no code needed to receive
+lanxfer serve --open  # headless receiver, no code needed
+```
+
 ### Headless receiver
 
 If you want a machine to only receive (e.g., a server with no interactive shell):
@@ -85,6 +94,7 @@ lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3 --overwrite --jo
 | Command | Description |
 |---------|-------------|
 | `lanxfer` | Peer mode (default) — auto-serve + auto-discover |
+| `lanxfer --open` | Peer mode without pairing codes (trusted networks) |
 | `lanxfer interactive` | Sender-only interactive session |
 | `lanxfer serve` | Headless receiver |
 | `lanxfer discover` | Find receivers on network |
@@ -94,15 +104,29 @@ lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3 --overwrite --jo
 
 ## Performance
 
-lanxfer is optimized for maximum LAN throughput:
+Protocol v3 is built to hit the hardware limit, not the protocol limit:
 
-- **4 MB I/O buffers** on both sender and receiver
-- **4 MB socket buffers** (SO_SNDBUF/SO_RCVBUF) to reduce kernel copies
-- **TCP_NODELAY** for low-latency control messages
-- **Parallel workers** saturate the link with multiple file streams
-- **Raw TCP streaming** — file data goes directly on the wire, no framing overhead
+- **Manifest sessions** — the whole file tree is negotiated in one round-trip.
+  Files then stream back-to-back over persistent connections with zero
+  per-file handshakes. 10k small files cost ~2 round-trips total, not ~40k.
+- **Merkle striping** — files ≥ 256 MiB are split into 64 MiB stripes sent
+  over parallel TCP connections. Stripe boundaries align with BLAKE3's
+  internal Merkle tree (2¹⁶ × 1 KiB chunks), so each side hashes stripes
+  independently — in any order, on any connection — and merges the subtree
+  chaining values into the exact whole-file BLAKE3 hash. Parallel transfer
+  *and* parallel verification, no extra disk pass.
+- **Single-pass receiving** — the receiver hashes while writing. (v2 re-read
+  every completed file from disk to verify it: 2× disk I/O, now gone.)
+- **Skip-unchanged** — re-sending a tree skips files whose size+mtime already
+  match; a repeat send of 10k files finishes in ~2 s.
+- **4 MB I/O + socket buffers**, TCP_NODELAY, raw TCP streaming.
 
-On a gigabit LAN, expect 800-950 Mbps. On 300 Mbps WiFi, you'll hit the link limit.
+Loopback benchmark (Windows 11, NVMe): 1.5 GiB file in 1.14 s (~10.5 Gbps
+effective); 10k × 4 KiB files in 9.2 s (v2: 15.1 s — and v2's per-file
+round-trips cost far more on a real network than on loopback).
+
+On a gigabit LAN expect wire speed; on 2.5/10 GbE and WiFi the striped
+parallel streams keep the link full where a single TCP flow stalls.
 
 ### Tips to maximize speed
 
@@ -135,30 +159,35 @@ New-NetFirewallRule -DisplayName "lanxfer TCP" -Direction Inbound -Protocol TCP 
 New-NetFirewallRule -DisplayName "lanxfer UDP" -Direction Inbound -Protocol UDP -LocalPort 44819 -Action Allow
 ```
 
-## Architecture
+## Architecture (protocol v3)
 
 ```
-Sender                          Receiver
-──────                          ────────
-lanxfer (interactive)           lanxfer serve
-  │                               │
-  ├─ UDP discovery ──────────────►├─ UDP responder (44819)
-  │  (broadcast + subnet scan)    │
-  │                               │
-  ├─ TCP connect ────────────────►├─ TCP listener (44818)
-  │  Hello/HelloAck handshake     │
-  │                               │
-  ├─ ListDestinations ──────────►├─ Returns drives/mounts
-  ├─ BrowseDirectory ───────────►├─ Returns dir contents
-  │                               │
-  ├─ CreateDirectory ───────────►├─ mkdir -p
-  ├─ PrepareUpload ─────────────►├─ Check resume state
-  ├─ BeginUpload ───────────────►├─ Ready to receive
-  ├─ [raw file bytes] ──────────►├─ Write to .lanxfer.part
-  │                               ├─ Verify BLAKE3 hash
-  │                               ├─ Rename to final
-  ◄── TransferResult ────────────┤
+Sender                              Receiver
+──────                              ────────
+  ├─ UDP discovery ────────────────►├─ UDP responder (44819)
+  │                                 │
+  ├─ control conn ─────────────────►├─ TCP listener (44818)
+  │   Hello/HelloAck                │
+  │   BeginSession {manifest} ─────►├─ mkdirs, plans every file
+  │  ◄── SessionPlan ───────────────┤   (send / resume / skip / conflict)
+  │                                 │
+  ├─ N data conns: JoinSession ────►│
+  │   SendFile{id,offset,len} ─────►├─ write at offset, hash while writing
+  │   [raw bytes] SendFile […] ────►│   (stripes: BLAKE3 subtree CVs,
+  │   back-to-back, no acks         │    merged into whole-file hash)
+  │                                 │
+  │  ◄── FileDone{id,hash} ─────────┤  on the control conn, async
 ```
+
+Files ≥ 256 MiB travel as 64 MiB stripes spread across the data
+connections; everything else streams whole, back-to-back.
+
+## Web version
+
+`web/` contains a Next.js app (RetroUI) for browser↔browser transfers over
+WebRTC — end-to-end encrypted (DTLS), works across the internet, no server
+storage; the public PeerJS broker is used for connection setup only. Deploy
+with `vercel` from `web/`, or run locally with `bun run dev`.
 
 ## License
 
