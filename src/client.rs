@@ -840,12 +840,20 @@ pub async fn send_path(
     Ok(())
 }
 
+async fn connect_with_timeout(addr: &str) -> Result<TcpStream> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => bail!("connection to {addr} timed out after 5s"),
+    }
+}
+
 pub(crate) async fn connect_and_handshake(
     target: &str,
     port: u16,
 ) -> Result<(TcpStream, crate::protocol::DeviceInfo)> {
     let addr = format!("{target}:{port}");
-    let mut stream = TcpStream::connect(&addr).await?;
+    let mut stream = connect_with_timeout(&addr).await?;
     stream.set_nodelay(true)?;
     tune_socket(&stream);
 
@@ -874,7 +882,12 @@ pub(crate) async fn connect_and_handshake(
 }
 
 pub(crate) async fn scan_source(source: &Path) -> Result<ScanResult> {
-    let meta = fs::metadata(source).await?;
+    let source = source.to_path_buf();
+    tokio::task::spawn_blocking(move || scan_source_sync(&source)).await?
+}
+
+fn scan_source_sync(source: &Path) -> Result<ScanResult> {
+    let meta = std::fs::metadata(source)?;
     let mut directories = Vec::new();
     let mut files = Vec::new();
 
@@ -991,7 +1004,8 @@ pub async fn receive_session(
     let local_port = listener.local_addr()?.port();
 
     // Connect back to the server's control connection to send JoinSession.
-    let mut control = TcpStream::connect(format!("{server_ip}:{data_port}")).await?;
+    let mut control =
+        connect_with_timeout(&format!("{server_ip}:{data_port}")).await?;
     control.set_nodelay(true)?;
     tune_socket(&control);
 

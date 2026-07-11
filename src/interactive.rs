@@ -154,6 +154,10 @@ async fn peer_loop(
     let local_ips = local_ipv4s();
     let my_host = util::host_name();
 
+    // Track connected peers for the "Connected peers" section in the picker.
+    // Each entry: (ip, port, name, label, stream).
+    let mut connected_peers: Vec<(String, u16, String, String, TcpStream)> = Vec::new();
+
     loop {
         // Initial scan.
         screen.render(
@@ -165,6 +169,10 @@ async fn peer_loop(
         )?;
         let mut hosts = scan_hosts(discovery_port, timeout_ms, exclude_self, &local_ips, &my_host).await;
         let mut items = hosts_to_items(&hosts);
+        // Add connected peers section (separator + entries).
+        for (_, _, _, label, _) in &connected_peers {
+            items.push(format!("\u{25cf} {label}"));
+        }
         items.push("Enter IP manually".to_string());
         items.push("\u{21bb} Rescan".to_string());
         items.push("\u{2717} Quit".to_string());
@@ -176,10 +184,9 @@ async fn peer_loop(
 
         enum PickerResult {
             Selected(usize, usize),
-            PeerConnected(TcpStream, String, u16, String),
         }
 
-        let result: PickerResult = 'picker: loop {
+        let result: PickerResult = loop {
             let visible = filtered(&items, &query);
             selected = selected.min(visible.len().saturating_sub(1));
             screen.draw_list(picker_title, &items, &visible, selected, &query, NAV_HELP)?;
@@ -190,6 +197,9 @@ async fn peer_loop(
                     if let Ok(new_hosts) = task.await {
                         hosts = new_hosts;
                         items = hosts_to_items(&hosts);
+                        for (_, _, _, label, _) in &connected_peers {
+                            items.push(format!("\u{25cf} {label}"));
+                        }
                         items.push("Enter IP manually".to_string());
                         items.push("\u{21bb} Rescan".to_string());
                         items.push("\u{2717} Quit".to_string());
@@ -213,7 +223,18 @@ async fn peer_loop(
             if let Some(rx) = &mut server_rx {
                 while let Ok(evt) = rx.try_recv() {
                     if let ServerEvent::PeerConnected(stream, name, port, ip) = evt {
-                        break 'picker PickerResult::PeerConnected(stream, name, port, ip);
+                        let label = format!("{name} ({ip})");
+                        // Queue for the picker — user selects when ready.
+                        connected_peers.push((ip, port, name, label, stream));
+                        // Rebuild items to include the new connected peer.
+                        items = hosts_to_items(&hosts);
+                        for (_, _, _, lbl, _) in &connected_peers {
+                            items.push(format!("\u{25cf} {lbl}"));
+                        }
+                        items.push("Enter IP manually".to_string());
+                        items.push("\u{21bb} Rescan".to_string());
+                        items.push("\u{2717} Quit".to_string());
+                        selected = selected.min(items.len().saturating_sub(1));
                     }
                 }
             }
@@ -259,49 +280,89 @@ async fn peer_loop(
             }
         };
 
-        // A peer connected while we were in the picker — show connected state.
-        if let PickerResult::PeerConnected(stream, client_name, client_port, client_ip) = result {
-            server::connected_peer_ui(
-                screen,
-                stream,
-                &client_name,
-                &client_ip,
-                client_port,
-                default_port,
-                &mut transfers,
-            )
-            .await?;
-            continue;
-        }
+        let PickerResult::Selected(sel, _items_len) = result;
 
-        let PickerResult::Selected(sel, items_len) = result else {
-            unreachable!();
-        };
+        let host_count = hosts.len();
+        let connected_count = connected_peers.len();
+        let manual_idx = host_count + connected_count;
+        let rescan_idx = manual_idx + 1;
+        let quit_idx = rescan_idx + 1;
 
-        let (ip, control_port, label) = if sel == items_len - 1 {
+        let (ip, control_port, label) = if sel == quit_idx {
             return Ok(());
-        } else if sel == items_len - 2 {
+        } else if sel == rescan_idx {
             continue; // Rescan
-        } else if sel == items_len - 3 {
+        } else if sel == manual_idx {
             let Some(ip) = text(screen, "Receiver IP", "esc to go back", false)? else {
                 continue;
             };
             let ip = ip.trim().to_string();
             (ip.clone(), default_port, ip)
-        } else {
-            // Host entry — re-scan to get fresh list, pick by index.
+        } else if sel < host_count {
+            // Discovered host — re-scan to get fresh list, pick by index.
             let fresh_hosts = scan_hosts(discovery_port, timeout_ms, exclude_self, &local_ips, &my_host).await;
             if sel >= fresh_hosts.len() {
                 continue;
             }
             let h = &fresh_hosts[sel];
             (h.ip.clone(), h.reply.control_port, h.reply.host.clone())
+        } else {
+            // Connected peer entry.
+            let idx = sel - host_count;
+            if idx >= connected_peers.len() {
+                continue;
+            }
+            let (ip, port, name, label, stream) = connected_peers.remove(idx);
+            // Dispatch to connected_peer_ui with the queued stream.
+            let result = connected_peer_ui(
+                screen,
+                stream,
+                &name,
+                &ip,
+                port,
+                default_port,
+                &mut codes,
+                &mut transfers,
+            )
+            .await;
+            match result {
+                Ok(()) => {}
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    let is_disconnect = msg.contains("connection closed")
+                        || msg.contains("broken pipe")
+                        || msg.contains("connection aborted")
+                        || msg.contains("unexpected end of file")
+                        || msg.contains("Connection closed");
+                    if is_disconnect {
+                        screen.render(
+                            "Connection",
+                            &format!("Peer {label} disconnected"),
+                            crate::picker::Tone::Info,
+                            &[],
+                            "Returning to peer list…",
+                        )?;
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                    } else {
+                        screen.render(
+                            "Connection",
+                            &msg,
+                            crate::picker::Tone::Error,
+                            &[],
+                            "Rescanning automatically…",
+                        )?;
+                        tokio::time::sleep(Duration::from_millis(900)).await;
+                    }
+                }
+            }
+            continue;
         };
 
         match peer_session(
             screen,
             &ip,
             control_port,
+            default_port,
             &label,
             &mut codes,
             &mut transfers,
@@ -373,6 +434,265 @@ fn hosts_to_items(hosts: &[discovery::DiscoveredHost]) -> Vec<String> {
         .collect()
 }
 
+/// Symmetric connected-peer UI for incoming connections.
+/// Uses the same non-blocking try_choose loop and shared send/receive flows
+/// as `peer_session`. Handles incoming transfers (BeginSession) while showing
+/// the menu. Runs until the client disconnects or the user presses Esc.
+#[allow(clippy::too_many_arguments)]
+pub async fn connected_peer_ui(
+    screen: &mut crate::picker::StatusScreen,
+    stream: TcpStream,
+    client_name: &str,
+    client_ip: &str,
+    client_port: u16,
+    local_port: u16,
+    codes: &mut HashMap<String, String>,
+    transfers: &mut Vec<TransferRecord>,
+) -> Result<()> {
+    use tokio::io::BufReader;
+
+    // Split stream for concurrent read/write.
+    let (read_half, write_half) = stream.into_split();
+    let reader = BufReader::with_capacity(4 * 1024 * 1024, read_half);
+
+    // Channel: reader task → UI.
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    // Channel: UI → writer task.
+    let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ControlMessage>();
+
+    // Reader task.
+    tokio::spawn(async move {
+        let mut reader = reader;
+        while let Ok(msg) = read_control(&mut reader).await {
+            let _ = msg_tx.send(msg);
+        }
+        let _ = msg_tx.send(ControlMessage::Error {
+            message: "connection closed".to_string(),
+        });
+    });
+
+    // Writer task.
+    let mut write_half = write_half;
+    tokio::spawn(async move {
+        while let Some(msg) = cmd_rx.recv().await {
+            if send_control(&mut write_half, &msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut last_dest: Option<String> = None;
+    let mut last_source: Option<String> = None;
+    let label = format!("{client_name} ({client_ip})");
+    let auth_required = false; // incoming connections don't need pairing code
+
+    loop {
+        // Build menu (same as peer_session).
+        enum Action {
+            Send,
+            SendAgain,
+            Receive,
+            ReceiveAgain,
+            Drives,
+            History,
+            Disconnect,
+        }
+        let mut menu: Vec<(String, Action)> = vec![("Send files".to_string(), Action::Send)];
+        if let Some(dest) = &last_dest {
+            menu.push((format!("Send more to {dest}"), Action::SendAgain));
+        }
+        menu.push(("Receive files".to_string(), Action::Receive));
+        if let Some(source) = &last_source {
+            menu.push((format!("Receive more from {source}"), Action::ReceiveAgain));
+        }
+        menu.push(("List remote drives".to_string(), Action::Drives));
+        menu.push((
+            format!("Transfers this session ({})", transfers.len()),
+            Action::History,
+        ));
+        menu.push(("Disconnect".to_string(), Action::Disconnect));
+
+        let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
+        let nav_help = "↑↓ move · type to filter · enter select · esc back";
+
+        // Non-blocking event loop: processes keyboard input AND incoming messages.
+        let mut query = String::new();
+        let mut selected = 0usize;
+        let sel: Option<usize> = loop {
+            let visible = filtered(&labels, &query);
+            selected = selected.min(visible.len().saturating_sub(1));
+
+            match screen.try_choose(
+                &format!("{label} · what next?"),
+                &labels,
+                &visible,
+                &mut selected,
+                &mut query,
+                nav_help,
+            )? {
+                Some(Some(idx)) => break Some(idx),
+                Some(None) => return Ok(()), // esc = disconnect
+                None => {}                    // no input — check messages
+            }
+
+            // Check for incoming messages (incoming transfers from this peer).
+            while let Ok(msg) = msg_rx.try_recv() {
+                match msg {
+                    ControlMessage::BeginSession {
+                        destination_path,
+                        auth_code: _,
+                        overwrite: _,
+                        dry_run: _,
+                        files,
+                        dirs: _,
+                    } => {
+                        // Wait for SessionPlan.
+                        let mut session_id = String::new();
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while Instant::now() < deadline {
+                            if let Ok(ControlMessage::SessionPlan {
+                                session_id: sid,
+                                actions: _,
+                            }) = msg_rx.try_recv()
+                            {
+                                session_id = sid;
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+
+                        let screen_title = format!("Receiving from {label}");
+                        screen.render(
+                            &screen_title,
+                            &format!("{} files incoming…", files.len()),
+                            crate::picker::Tone::Info,
+                            &[("destination".into(), destination_path)],
+                            "accepting transfer…",
+                        )?;
+
+                        let server_ip = client_ip.to_string();
+                        let data_port = local_port;
+                        let files_clone = files.clone();
+                        let sid = session_id.clone();
+                        tokio::spawn(async move {
+                            match client::receive_session(&sid, &server_ip, data_port, &files_clone)
+                                .await
+                            {
+                                Ok(s) => {
+                                    eprintln!(
+                                        "received {} files ({} bytes)",
+                                        s.files_received, s.bytes
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("receive failed: {e:#}");
+                                }
+                            }
+                        });
+                    }
+                    ControlMessage::Error { message }
+                        if message == "connection closed" => {
+                        screen.render(
+                            "Disconnected",
+                            &format!("Peer {label} disconnected"),
+                            crate::picker::Tone::Info,
+                            &[],
+                            "returning to peer list…",
+                        )?;
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let Some(sel) = sel else {
+            unreachable!()
+        };
+        let result = match &menu[sel].1 {
+            Action::Send => {
+                send_flow(
+                    screen,
+                    client_ip,
+                    client_port,
+                    &label,
+                    auth_required,
+                    codes,
+                    transfers,
+                    &mut last_dest,
+                    None,
+                )
+                .await
+            }
+            Action::SendAgain => {
+                let dest = last_dest.clone();
+                send_flow(
+                    screen,
+                    client_ip,
+                    client_port,
+                    &label,
+                    auth_required,
+                    codes,
+                    transfers,
+                    &mut last_dest,
+                    dest,
+                )
+                .await
+            }
+            Action::Receive => {
+                receive_flow(
+                    screen,
+                    client_ip,
+                    client_port,
+                    &label,
+                    auth_required,
+                    codes,
+                    transfers,
+                    &mut last_source,
+                    None,
+                )
+                .await
+            }
+            Action::ReceiveAgain => {
+                let source = last_source.clone();
+                receive_flow(
+                    screen,
+                    client_ip,
+                    client_port,
+                    &label,
+                    auth_required,
+                    codes,
+                    transfers,
+                    &mut last_source,
+                    source,
+                )
+                .await
+            }
+            Action::Drives => list_drives(screen, client_ip, client_port).await,
+            Action::History => print_transfers(screen, transfers),
+            Action::Disconnect => return Ok(()),
+        };
+
+        if let Err(err) = result {
+            let msg = format!("{err:#}");
+            screen.render(
+                "Transfer",
+                &msg,
+                crate::picker::Tone::Error,
+                &[],
+                "enter / esc  continue",
+            )?;
+            screen.wait_for_close()?;
+            if msg.contains("pairing code") {
+                codes.remove(client_ip);
+            }
+        }
+    }
+}
+
 /// One connected session with a peer. Stays connected across sends —
 /// no rediscovery, no re-entering the pairing code.
 /// Returns Ok(true) if the user wants to quit entirely.
@@ -380,6 +700,7 @@ async fn peer_session(
     screen: &mut crate::picker::StatusScreen,
     ip: &str,
     port: u16,
+    local_port: u16,
     label: &str,
     codes: &mut HashMap<String, String>,
     transfers: &mut Vec<TransferRecord>,
@@ -388,7 +709,16 @@ async fn peer_session(
 
     // Persistent connection to the peer's server.
     let addr = format!("{ip}:{port}");
-    let mut stream = tokio::net::TcpStream::connect(&addr).await?;
+    let mut stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => bail!("connection to {addr} timed out after 5s"),
+    };
     stream.set_nodelay(true)?;
 
     // Handshake.
@@ -397,7 +727,7 @@ async fn peer_session(
         &ControlMessage::Hello {
             version: PROTOCOL_VERSION,
             client_name: util::host_name(),
-            client_port: 0, // not relevant for outgoing sessions
+            client_port: local_port,
         },
     )
     .await?;
