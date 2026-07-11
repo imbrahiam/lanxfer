@@ -14,6 +14,88 @@ const CYAN: Color = Color::Cyan;
 const VIOLET: Color = Color::Magenta;
 const MUTED: Color = Color::DarkGray;
 
+#[derive(Clone, Copy)]
+pub enum Tone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+pub struct StatusScreen {
+    terminal: Option<ratatui::DefaultTerminal>,
+}
+
+impl StatusScreen {
+    pub fn new() -> Result<Self> {
+        if !std::io::stdout().is_terminal() {
+            return Ok(Self { terminal: None });
+        }
+        let mut terminal = ratatui::init();
+        terminal.clear()?;
+        Ok(Self {
+            terminal: Some(terminal),
+        })
+    }
+
+    pub fn render(
+        &mut self,
+        title: &str,
+        message: &str,
+        tone: Tone,
+        details: &[(String, String)],
+        footer: &str,
+    ) -> Result<()> {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.draw(|frame| draw_status(frame, title, message, tone, details, footer))?;
+        } else {
+            println!("{title}: {message}");
+            for (key, value) in details {
+                println!("{key}: {value}");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn choose(
+        &mut self,
+        title: &str,
+        items: Vec<String>,
+        start: usize,
+        help: &str,
+    ) -> Result<Option<usize>> {
+        if let Some(terminal) = &mut self.terminal {
+            run(terminal, title, &items, start, help)
+        } else {
+            Ok(items.get(start).map(|_| start))
+        }
+    }
+
+    pub fn wait_for_close(&mut self) -> Result<()> {
+        if self.terminal.is_none() {
+            return Ok(());
+        }
+        loop {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind == KeyEventKind::Press
+                && matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
+            {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl Drop for StatusScreen {
+    fn drop(&mut self) {
+        if self.terminal.is_some() {
+            ratatui::restore();
+        }
+    }
+}
+
 pub fn select(title: &str, items: Vec<String>, start: usize, help: &str) -> Result<Option<usize>> {
     if !std::io::stdout().is_terminal() {
         return Ok(items.get(start).map(|_| start));
@@ -177,6 +259,92 @@ fn draw_loading(frame: &mut ratatui::Frame, title: &str, message: &str) {
     );
     frame.render_widget(
         Paragraph::new("Discovery usually takes a few seconds").style(Style::default().fg(MUTED)),
+        rows[3],
+    );
+}
+
+fn draw_status(
+    frame: &mut ratatui::Frame,
+    title: &str,
+    message: &str,
+    tone: Tone,
+    details: &[(String, String)],
+    footer: &str,
+) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::reset()), area);
+    let height = (details.len() as u16 + 12).clamp(14, 28);
+    let card = centered(area, area.width.min(82), area.height.min(height));
+    frame.render_widget(Clear, card);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED))
+            .style(Style::reset())
+            .padding(Padding::horizontal(2)),
+        card,
+    );
+    let inner = Rect::new(
+        card.x + 3,
+        card.y + 2,
+        card.width.saturating_sub(6),
+        card.height.saturating_sub(4),
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(2),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    let (symbol, color) = match tone {
+        Tone::Info => ("◌", CYAN),
+        Tone::Success => ("✓", Color::Green),
+        Tone::Warning => ("⚠", Color::Yellow),
+        Tone::Error => ("✗", Color::Red),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "⇄  LANXFER",
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   {title}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{symbol}  "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(message, Style::default().add_modifier(Modifier::BOLD)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(MUTED)),
+        ),
+        rows[1],
+    );
+    let detail_lines: Vec<Line> = details
+        .iter()
+        .map(|(key, value)| {
+            Line::from(vec![
+                Span::styled(format!("{key:>14}  "), Style::default().fg(MUTED)),
+                Span::raw(value),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(detail_lines), rows[2]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(MUTED)),
         rows[3],
     );
 }

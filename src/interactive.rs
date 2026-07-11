@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use inquire::{Confirm, InquireError, Text};
+use inquire::{InquireError, Text};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -37,11 +37,16 @@ fn text(prompt: &str, help: &str) -> Result<Option<String>> {
 }
 
 fn confirm(prompt: &str, default: bool) -> Result<bool> {
-    match Confirm::new(prompt).with_default(default).prompt() {
-        Ok(v) => Ok(v),
-        Err(InquireError::OperationCanceled) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
+    let items = if default {
+        vec!["Yes".to_string(), "No".to_string()]
+    } else {
+        vec!["No".to_string(), "Yes".to_string()]
+    };
+    let selection = crate::picker::select(prompt, items, 0, "↑↓ move · enter select · esc cancel")?;
+    Ok(match selection {
+        Some(index) => (default && index == 0) || (!default && index == 1),
+        None => false,
+    })
 }
 
 const NAV_HELP: &str = "↑↓ move · type to filter · enter select · esc back";
@@ -153,7 +158,12 @@ async fn peer_loop(
         match peer_session(&ip, control_port, &label, &mut codes, &mut transfers).await {
             Ok(true) => return Ok(()), // user chose quit
             Ok(false) => {}            // switch peer -> rescan
-            Err(err) => ui::error(&format!("{err:#}")),
+            Err(err) => ui::modal(
+                "Connection",
+                &format!("{err:#}"),
+                crate::picker::Tone::Error,
+                vec![],
+            )?,
         }
     }
 }
@@ -168,13 +178,7 @@ async fn peer_session(
     codes: &mut HashMap<String, String>,
     transfers: &mut Vec<TransferRecord>,
 ) -> Result<bool> {
-    let (device, auth_required) = handshake_info(ip, port).await?;
-    ui::success(&format!(
-        "connected to {} ({} {})",
-        ui::bold(&device.host_name),
-        device.os,
-        device.arch
-    ));
+    let (_device, auth_required) = handshake_info(ip, port).await?;
 
     let mut last_dest: Option<String> = None;
 
@@ -200,7 +204,6 @@ async fn peer_session(
         menu.push(("Quit".to_string(), Action::Quit));
 
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
-        println!();
         let Some(sel) = select(
             &format!("{label} · what next?"),
             labels,
@@ -240,17 +243,14 @@ async fn peer_session(
                 .await
             }
             Action::Drives => list_drives(ip, port).await,
-            Action::History => {
-                print_transfers(transfers);
-                Ok(())
-            }
+            Action::History => print_transfers(transfers),
             Action::SwitchPeer => return Ok(false),
             Action::Quit => return Ok(true),
         };
 
         if let Err(err) = result {
             let msg = format!("{err:#}");
-            ui::error(&msg);
+            ui::modal("Transfer", &msg, crate::picker::Tone::Error, vec![])?;
             if msg.contains("pairing code") {
                 // wrong/stale code — forget it so the next attempt re-prompts
                 codes.remove(ip);
@@ -318,29 +318,30 @@ fn local_ipv4s() -> Vec<String> {
 
 async fn list_drives(ip: &str, port: u16) -> Result<()> {
     let items = fetch_destinations(ip, port).await?;
-    ui::section("Remote drives");
-    println!(
-        "  {}  {}  {}  {}",
-        ui::dim(&format!("{:<12}", "LABEL")),
-        ui::dim(&format!("{:<32}", "PATH")),
-        ui::dim(&format!("{:>10}", "FREE")),
-        ui::dim("MODE"),
-    );
-    for item in &items {
-        let mode = if item.read_only {
-            ui::dim("read-only")
-        } else {
-            ui::ok("writable")
-        };
-        println!(
-            "  {}  {}  {}  {}",
-            format_args!("{:<12}", item.label),
-            ui::bold(&format!("{:<32}", item.path)),
-            format_args!("{:>10}", util::format_size(item.available_bytes)),
-            mode
-        );
-    }
-    Ok(())
+    let details = items
+        .iter()
+        .map(|item| {
+            let mode = if item.read_only {
+                "read-only"
+            } else {
+                "writable"
+            };
+            (
+                item.label.clone(),
+                format!(
+                    "{}  ·  {} free  ·  {mode}",
+                    item.path,
+                    util::format_size(item.available_bytes)
+                ),
+            )
+        })
+        .collect();
+    ui::modal(
+        "Remote drives",
+        &format!("{} destination(s)", items.len()),
+        crate::picker::Tone::Info,
+        details,
+    )
 }
 
 async fn fetch_destinations(ip: &str, port: u16) -> Result<Vec<DestinationInfo>> {
@@ -366,7 +367,6 @@ async fn send_flow(
     reuse_dest: Option<String>,
 ) -> Result<()> {
     let Some(auth_code) = ensure_code(ip, auth_required, codes)? else {
-        ui::info("cancelled");
         return Ok(());
     };
     let auth = auth_code.as_deref();
@@ -394,39 +394,25 @@ async fn send_flow(
                 .collect();
 
             let Some(drive_idx) = select("Destination drive", drive_items, 0, NAV_HELP)? else {
-                ui::info("cancelled");
                 return Ok(());
             };
 
             match browse_remote_dir(ip, port, &writable[drive_idx].path, auth).await? {
                 Some(path) => path,
-                None => {
-                    ui::info("cancelled");
-                    return Ok(());
-                }
+                None => return Ok(()),
             }
         }
     };
 
     let local_paths = match pick_local_paths()? {
         Some(paths) if !paths.is_empty() => paths,
-        _ => {
-            ui::info("nothing selected");
-            return Ok(());
-        }
+        _ => return Ok(()),
     };
 
-    ui::section("Confirm");
-    ui::kv("destination", &remote_path);
-    for path in &local_paths {
-        ui::kv("source", &path.display().to_string());
-    }
     if !confirm("Start transfer?", true)? {
-        ui::info("cancelled");
         return Ok(());
     }
 
-    ui::section("Transfer");
     let source_label = if local_paths.len() == 1 {
         local_paths[0].display().to_string()
     } else {
@@ -475,56 +461,65 @@ async fn send_flow(
     *last_dest = Some(remote_path);
 
     let summary = result?;
-    println!();
-    ui::kv("transferred", &summary.transferred.to_string());
+    let mut details = vec![("transferred".into(), summary.transferred.to_string())];
     if summary.skipped_up_to_date > 0 {
-        ui::kv("up to date", &summary.skipped_up_to_date.to_string());
+        details.push(("up to date".into(), summary.skipped_up_to_date.to_string()));
     }
     if summary.conflicts > 0 {
-        ui::kv(
-            "conflicts",
-            &format!("{} (already exist on receiver)", summary.conflicts),
-        );
+        details.push((
+            "conflicts".into(),
+            format!("{} already exist on receiver", summary.conflicts),
+        ));
     }
     if !summary.errors.is_empty() {
         for err in &summary.errors {
-            ui::error(err);
+            details.push(("error".into(), err.clone()));
         }
         bail!("some transfers failed — send again to retry (transfers resume)");
     }
-    ui::success("all transfers complete");
-    Ok(())
+    ui::modal(
+        "Transfer",
+        "All transfers complete",
+        crate::picker::Tone::Success,
+        details,
+    )
 }
 
-fn print_transfers(transfers: &[TransferRecord]) {
-    ui::section("Transfers this session");
-    if transfers.is_empty() {
-        ui::info("none yet");
-        return;
-    }
-    for t in transfers {
-        let status = if t.ok {
-            ui::ok("✓")
+fn print_transfers(transfers: &[TransferRecord]) -> Result<()> {
+    let details = transfers
+        .iter()
+        .enumerate()
+        .map(|(index, t)| {
+            let status = if t.ok { "✓" } else { "✗" };
+            let skipped = if t.skipped > 0 {
+                format!(", {} skipped", t.skipped)
+            } else {
+                String::new()
+            };
+            (
+                format!("{} {}", index + 1, status),
+                format!(
+                    "{}  ·  {} files{}  ·  {} → {}:{}",
+                    util::format_size(t.bytes),
+                    t.files,
+                    skipped,
+                    t.source,
+                    t.peer,
+                    t.dest
+                ),
+            )
+        })
+        .collect();
+    ui::modal(
+        "Session history",
+        if transfers.is_empty() {
+            "No transfers yet"
         } else {
-            ui::yellow("✗")
-        };
-        let skipped = if t.skipped > 0 {
-            format!(", {} skipped", t.skipped)
-        } else {
-            String::new()
-        };
-        println!(
-            "  {} {}  {}",
-            status,
-            format_args!(
-                "{:<7} {} files{}",
-                util::format_size(t.bytes),
-                t.files,
-                skipped
-            ),
-            ui::dim(&format!("{} → {}:{}", t.source, t.peer, t.dest)),
-        );
-    }
+            "Transfers this session"
+        },
+        crate::picker::Tone::Info,
+        details,
+    )
 }
 
 /// Returns Ok(None) when the user backs out with Esc.

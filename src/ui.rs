@@ -1,25 +1,7 @@
-use console::{Term, style};
+use console::style;
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 
-/// Clear the terminal and print the one-line banner. Every entrypoint calls
-/// this so stale shell output never mixes with the session.
-pub fn banner() {
-    let term = Term::stdout();
-    let _ = term.clear_screen();
-    println!();
-    println!(
-        "  {}  {}  {}",
-        style("◆").color256(81).bold(),
-        style("LANXFER").bold(),
-        style(format!(
-            "v{}  /  fast, private, resumable",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .dim(),
-    );
-    println!("  {}", style("━".repeat(54)).dim());
-    println!();
-}
+use crate::picker::{StatusScreen, Tone};
 
 /// Global inquire style — cyan accents, subtle chrome.
 pub fn init_prompts() {
@@ -58,6 +40,29 @@ pub fn warn(msg: &str) {
 
 pub fn error(msg: &str) {
     eprintln!("  {} {msg}", style("✗").red().bold());
+}
+
+pub fn fatal(msg: &str) {
+    if let Ok(mut screen) = StatusScreen::new()
+        && screen
+            .render("Error", msg, Tone::Error, &[], "enter / esc  close")
+            .is_ok()
+    {
+        let _ = screen.wait_for_close();
+        return;
+    }
+    eprintln!("Error: {msg}");
+}
+
+pub fn modal(
+    title: &str,
+    message: &str,
+    tone: Tone,
+    details: Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    let mut screen = StatusScreen::new()?;
+    screen.render(title, message, tone, &details, "enter / esc  close")?;
+    screen.wait_for_close()
 }
 
 pub fn kv(key: &str, value: &str) {
