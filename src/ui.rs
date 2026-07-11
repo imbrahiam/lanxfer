@@ -8,15 +8,16 @@ pub fn banner() {
     let _ = term.clear_screen();
     println!();
     println!(
-        "  {} {}  {}",
-        style("⇄").cyan().bold(),
-        style("lanxfer").bold(),
+        "  {}  {}  {}",
+        style("◆").color256(81).bold(),
+        style("LANXFER").white().bold(),
         style(format!(
-            "v{} · fast resumable LAN transfer",
+            "v{}  /  fast, private, resumable",
             env!("CARGO_PKG_VERSION")
         ))
         .dim(),
     );
+    println!("  {}", style("━".repeat(54)).color256(238));
     println!();
 }
 
@@ -94,9 +95,9 @@ pub fn progress_chars() -> &'static str {
 
 /// indicatif style fragments for the smooth two-tone bar.
 pub fn overall_bar_template() -> &'static str {
-    "  {spinner:.cyan} {bar:38.cyan/238} {bytes:>10} / {total_bytes:<10} {binary_bytes_per_sec:>11} · eta {eta} {msg}"
+    "  {spinner:.cyan} {bar:38.cyan/238}  {percent:>3}%  {bytes:>10}/{total_bytes:<10}  {binary_bytes_per_sec:>11}  {eta}  {msg}"
 }
 
 pub fn unit_bar_template() -> &'static str {
-    "    {bar:30.green/238} {prefix:.dim} {bytes:>9}"
+    "    {bar:30.magenta/238}  {prefix:.dim}  {bytes:>9}"
 }

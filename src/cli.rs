@@ -83,4 +83,13 @@ pub enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Check for updates or install the latest GitHub release.
+    Update {
+        /// Only check; do not replace the current executable.
+        #[arg(long)]
+        check: bool,
+        /// Install without asking for confirmation.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }

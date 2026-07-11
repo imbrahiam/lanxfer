@@ -1,6 +1,5 @@
 use anyhow::{Result, bail};
-use console::Term;
-use inquire::{Confirm, InquireError, Select, Text};
+use inquire::{Confirm, InquireError, Text};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -26,19 +25,7 @@ pub struct TransferRecord {
 /// Run a Select, return the chosen index; Esc returns None (go back).
 /// The answered line is cleared so looping menus don't accumulate residue.
 fn select(prompt: &str, items: Vec<String>, cursor: usize, help: &str) -> Result<Option<usize>> {
-    let result = Select::new(prompt, items)
-        .with_page_size(list_max_length())
-        .with_starting_cursor(cursor)
-        .with_help_message(help)
-        .raw_prompt();
-    match result {
-        Ok(choice) => {
-            let _ = Term::stdout().clear_last_lines(1);
-            Ok(Some(choice.index))
-        }
-        Err(InquireError::OperationCanceled) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    crate::picker::select(prompt, items, cursor, help)
 }
 
 fn text(prompt: &str, help: &str) -> Result<Option<String>> {
@@ -344,9 +331,9 @@ async fn list_drives(ip: &str, port: u16) -> Result<()> {
         };
         println!(
             "  {}  {}  {}  {}",
-            format!("{:<12}", item.label),
+            format_args!("{:<12}", item.label),
             ui::bold(&format!("{:<32}", item.path)),
-            format!("{:>10}", util::format_size(item.available_bytes)),
+            format_args!("{:>10}", util::format_size(item.available_bytes)),
             mode
         );
     }
@@ -526,7 +513,7 @@ fn print_transfers(transfers: &[TransferRecord]) {
         println!(
             "  {} {}  {}",
             status,
-            format!(
+            format_args!(
                 "{:<7} {} files{}",
                 util::format_size(t.bytes),
                 t.files,
@@ -535,13 +522,6 @@ fn print_transfers(transfers: &[TransferRecord]) {
             ui::dim(&format!("{} → {}:{}", t.source, t.peer, t.dest)),
         );
     }
-}
-
-/// Max visible rows for selection lists — keeps inquire inside the
-/// terminal height so it never scroll-garbles.
-fn list_max_length() -> usize {
-    let rows = Term::stdout().size().0 as usize;
-    rows.saturating_sub(6).clamp(6, 18)
 }
 
 /// Returns Ok(None) when the user backs out with Esc.
@@ -678,13 +658,13 @@ fn pick_start_dir() -> Result<Option<PathBuf>> {
         ("Documents", dirs::document_dir()),
     ];
     for (label, dir) in shortcuts {
-        if let Some(dir) = dir {
-            if dir.is_dir() {
-                options.push((
-                    format!("{:<19} {}", label, dir.display()),
-                    StartChoice::Path(dir),
-                ));
-            }
+        if let Some(dir) = dir
+            && dir.is_dir()
+        {
+            options.push((
+                format!("{:<19} {}", label, dir.display()),
+                StartChoice::Path(dir),
+            ));
         }
     }
     if cfg!(windows) {
@@ -708,10 +688,9 @@ fn pick_start_dir() -> Result<Option<PathBuf>> {
     Ok(match &options[idx].1 {
         StartChoice::Path(p) => Some(p.clone()),
         StartChoice::Drives => pick_windows_drive()?,
-        StartChoice::Manual => match text("Enter path", "esc to go back")? {
-            Some(path) => Some(PathBuf::from(path.trim())),
-            None => None,
-        },
+        StartChoice::Manual => {
+            text("Enter path", "esc to go back")?.map(|path| PathBuf::from(path.trim()))
+        }
     })
 }
 
@@ -720,6 +699,7 @@ fn pick_start_dir() -> Result<Option<PathBuf>> {
 /// - selecting a file toggles it
 /// - "Add this whole folder" toggles the current directory
 /// - "Done" confirms; Esc goes up / backs out
+///
 /// Returns Ok(None) when the user backs out.
 fn pick_local_paths() -> Result<Option<Vec<PathBuf>>> {
     let Some(mut current_dir) = pick_start_dir()? else {
