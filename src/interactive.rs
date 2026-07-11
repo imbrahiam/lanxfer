@@ -53,20 +53,14 @@ pub async fn run_peer_mode(
     open: bool,
 ) -> Result<()> {
     ui::init_prompts();
-    ui::banner();
 
     let device = util::local_device_info();
     let pairing_code = util::generate_pairing_code();
-
-    ui::kv("host", &device.host_name);
-    ui::kv("platform", &format!("{} {}", device.os, device.arch));
-    if open {
-        ui::kv("pairing code", &ui::dim("off (--open)"));
-        ui::warn("anyone on this network can send files to you");
+    let picker_title = if open {
+        format!("{}  ·  open", device.host_name)
     } else {
-        ui::kv("pairing code", &ui::yellow(&pairing_code));
-        ui::info("share this code with peers who want to send to you");
-    }
+        format!("{}  ·  code {pairing_code}", device.host_name)
+    };
 
     let bind = format!("0.0.0.0:{port}");
     let server_code = pairing_code.clone();
@@ -76,15 +70,12 @@ pub async fn run_peer_mode(
         }
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    peer_loop(discovery_port, timeout_ms, port, true).await
+    peer_loop(discovery_port, timeout_ms, port, true, &picker_title).await
 }
 
 pub async fn run_interactive(discovery_port: u16, timeout_ms: u64, port: u16) -> Result<()> {
     ui::init_prompts();
-    ui::banner();
-    peer_loop(discovery_port, timeout_ms, port, false).await
+    peer_loop(discovery_port, timeout_ms, port, false, "Pick a peer").await
 }
 
 /// Discover peers, pick one, run a session. Repeats until the user quits.
@@ -94,6 +85,7 @@ async fn peer_loop(
     timeout_ms: u64,
     default_port: u16,
     exclude_self: bool,
+    picker_title: &str,
 ) -> Result<()> {
     let mut codes: HashMap<String, String> = HashMap::new();
     let mut transfers: Vec<TransferRecord> = Vec::new();
@@ -101,42 +93,53 @@ async fn peer_loop(
     let my_host = util::host_name();
 
     loop {
-        ui::section("Peers");
-        ui::info("scanning local network…");
-        let mut hosts = discovery::discover_hosts_with_fallback(discovery_port, timeout_ms).await?;
-        if exclude_self {
-            hosts.retain(|h| !local_ips.contains(&h.ip) && h.reply.host != my_host);
-        }
-
-        let mut items: Vec<String> = hosts
-            .iter()
-            .map(|h| {
-                format!(
-                    "{:<20}  {}:{}  {} {}",
-                    h.reply.host,
-                    h.ip,
-                    h.reply.control_port,
-                    h.reply.device.os,
-                    h.reply.device.arch
-                )
-            })
-            .collect();
-        if hosts.is_empty() {
-            ui::warn("no peers found — on another machine, run `lanxfer`");
-        }
-        items.push("Enter IP manually".to_string());
-        items.push("↻ Rescan".to_string());
-        items.push("✗ Quit".to_string());
-
-        let Some(sel) = select("Pick a peer", items.clone(), 0, NAV_HELP)? else {
+        let scan_ips = local_ips.clone();
+        let scan_host = my_host.clone();
+        let scan = async move {
+            let mut hosts =
+                discovery::discover_hosts_with_fallback(discovery_port, timeout_ms).await?;
+            if exclude_self {
+                hosts.retain(|h| !scan_ips.contains(&h.ip) && h.reply.host != scan_host);
+            }
+            Ok(hosts)
+        };
+        let (hosts, selection) = crate::picker::select_after(
+            picker_title,
+            "Scanning local network…",
+            0,
+            NAV_HELP,
+            scan,
+            |hosts| {
+                let mut items: Vec<String> = hosts
+                    .iter()
+                    .map(|h| {
+                        format!(
+                            "{:<20}  {}:{}  {} {}",
+                            h.reply.host,
+                            h.ip,
+                            h.reply.control_port,
+                            h.reply.device.os,
+                            h.reply.device.arch
+                        )
+                    })
+                    .collect();
+                items.push("Enter IP manually".to_string());
+                items.push("↻ Rescan".to_string());
+                items.push("✗ Quit".to_string());
+                items
+            },
+        )
+        .await?;
+        let Some(sel) = selection else {
             return Ok(()); // esc at top level = quit
         };
+        let items_len = hosts.len() + 3;
 
-        let (ip, control_port, label) = if sel == items.len() - 1 {
+        let (ip, control_port, label) = if sel == items_len - 1 {
             return Ok(());
-        } else if sel == items.len() - 2 {
+        } else if sel == items_len - 2 {
             continue;
-        } else if sel == items.len() - 3 {
+        } else if sel == items_len - 3 {
             let Some(ip) = text("Receiver IP", "esc to go back")? else {
                 continue;
             };
