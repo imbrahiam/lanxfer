@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const DEFAULT_CONTROL_PORT: u16 = 44818;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 44819;
 // Manifests carry the whole file tree in one frame.
@@ -166,6 +166,12 @@ pub enum ControlMessage {
         errors: Vec<String>,
     },
 
+    /// Sent by an interactive client right after the handshake to mark this
+    /// connection as a persistent peer-presence link (it appears in the
+    /// remote picker). Connections that don't attach are ordinary request
+    /// connections and are served normally.
+    Attach,
+
     Error {
         message: String,
     },
@@ -199,6 +205,22 @@ where
     R: AsyncRead + Unpin,
 {
     read_framed_json::<R, ControlMessage>(reader).await
+}
+
+/// `read_control` with a deadline — for interactive request/response
+/// round-trips that must never freeze the UI. Not for transfer waits,
+/// which can legitimately take minutes.
+pub async fn read_control_timeout<R>(
+    reader: &mut R,
+    wait: std::time::Duration,
+) -> Result<ControlMessage>
+where
+    R: AsyncRead + Unpin,
+{
+    match tokio::time::timeout(wait, read_control(reader)).await {
+        Ok(result) => result,
+        Err(_) => bail!("peer did not respond within {}s", wait.as_secs()),
+    }
 }
 
 pub async fn read_framed_json<R, T>(reader: &mut R) -> Result<T>

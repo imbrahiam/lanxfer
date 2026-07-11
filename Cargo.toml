@@ -1,6 +1,6 @@
 [package]
 name = "lanxfer"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "Fast resumable LAN file transfer CLI"
 license = "MIT"

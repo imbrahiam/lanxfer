@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::client;
 use crate::discovery;
 use crate::protocol::{
-    ControlMessage, DirSpec, FileAction, FileSpec, RemoteFileSpec, PROTOCOL_VERSION, PlanAction,
+    ControlMessage, DirSpec, FileAction, FileSpec, PROTOCOL_VERSION, PlanAction, RemoteFileSpec,
     read_control, send_control,
 };
 use crate::storage;
@@ -47,15 +47,17 @@ struct FileState {
     expects_data: bool,
 }
 
+/// Serve control connections on an already-bound listener. Binding happens
+/// at the call site so a busy port fails fast and visibly, not inside a
+/// background task.
 pub async fn run_server(
-    bind: String,
+    listener: TcpListener,
     discovery_port: u16,
     pairing_code: String,
     quiet_errors: bool,
     require_auth: bool,
     ui_tx: Option<mpsc::UnboundedSender<super::interactive::ServerEvent>>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(&bind).await?;
     let local = listener.local_addr()?;
     let device = util::local_device_info();
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -78,9 +80,15 @@ pub async fn run_server(
         let sessions = Arc::clone(&sessions);
         let ui_tx = ui_tx.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_client(socket, server_device, server_code, require_auth, sessions, ui_tx)
-                    .await
+            if let Err(err) = handle_client(
+                socket,
+                server_device,
+                server_code,
+                require_auth,
+                sessions,
+                ui_tx,
+            )
+            .await
                 && !quiet_errors
             {
                 let _ = (peer, err);
@@ -107,11 +115,11 @@ async fn handle_client(
     tune_socket(&stream);
 
     let first = read_control(&mut stream).await?;
-    let client_port = match first {
+    let (client_name, client_port) = match first {
         ControlMessage::Hello {
             version,
+            client_name,
             client_port,
-            ..
         } if version == PROTOCOL_VERSION => {
             send_control(
                 &mut stream,
@@ -122,7 +130,7 @@ async fn handle_client(
                 },
             )
             .await?;
-            client_port
+            (client_name, client_port)
         }
         ControlMessage::Hello { version, .. } => {
             let _ = send_control(
@@ -148,23 +156,6 @@ async fn handle_client(
         }
     };
 
-    // If a UI is connected, enter the interactive connected-state loop.
-    if let Some(tx) = ui_tx {
-        let client_name = match &first {
-            ControlMessage::Hello { client_name, .. } => client_name.clone(),
-            _ => "unknown".to_string(),
-        };
-        let client_ip = stream
-            .peer_addr()
-            .map(|a| a.ip().to_string())
-            .unwrap_or_default();
-        // Send the stream to the UI — it will handle the connected state.
-        let _ = tx.send(super::interactive::ServerEvent::PeerConnected(
-            stream, client_name, client_port, client_ip,
-        ));
-        return Ok(());
-    }
-
     loop {
         let msg = match read_control(&mut stream).await {
             Ok(msg) => msg,
@@ -172,6 +163,25 @@ async fn handle_client(
         };
 
         match msg {
+            ControlMessage::Attach => {
+                // Interactive presence link — hand the whole connection to
+                // the UI so this peer shows up in the picker. Headless serve
+                // just keeps the link open (peer stays connected, sends
+                // requests over separate connections).
+                if let Some(tx) = &ui_tx {
+                    let client_ip = stream
+                        .peer_addr()
+                        .map(|a| a.ip().to_string())
+                        .unwrap_or_default();
+                    let _ = tx.send(super::interactive::ServerEvent::PeerConnected(
+                        stream,
+                        client_name.clone(),
+                        client_port,
+                        client_ip,
+                    ));
+                    return Ok(());
+                }
+            }
             ControlMessage::ListDestinations => {
                 let items = storage::list_destinations();
                 send_control(&mut stream, &ControlMessage::Destinations { items }).await?;

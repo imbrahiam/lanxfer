@@ -13,11 +13,10 @@ use walkdir::WalkDir;
 use crate::discovery;
 use crate::protocol::{
     ControlMessage, DirSpec, FileSpec, PROTOCOL_VERSION, PlanAction, RemoteFileSpec, read_control,
-    send_control,
+    read_control_timeout, send_control,
 };
 use crate::ui;
 use crate::util;
-use tokio::fs::OpenOptions;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DirectoryEntry {
@@ -107,7 +106,7 @@ pub async fn send_session(
         .collect();
 
     // Control connection: manifest -> plan.
-    let (mut control, _device) = connect_and_handshake(target, port).await?;
+    let (mut control, _device, _) = connect_and_handshake(target, port).await?;
     send_control(
         &mut control,
         &ControlMessage::BeginSession {
@@ -394,7 +393,7 @@ pub async fn send_session(
 /// Pull files from a remote peer. Sends a PushRequest telling the remote to
 /// read its local files and push them to us. Waits for the transfer to
 /// complete on the remote side.
-pub async fn push_session(
+pub async fn pull_session(
     target: &str,
     port: u16,
     remote_files: &[RemoteFileSpec],
@@ -407,7 +406,7 @@ pub async fn push_session(
         bail!("no files selected for pull");
     }
 
-    let (mut control, _device) = connect_and_handshake(target, port).await?;
+    let (mut control, _device, _) = connect_and_handshake(target, port).await?;
     send_control(
         &mut control,
         &ControlMessage::PushRequest {
@@ -420,7 +419,7 @@ pub async fn push_session(
     )
     .await?;
 
-    match read_control(&mut control).await? {
+    match read_control_timeout(&mut control, std::time::Duration::from_secs(10)).await? {
         ControlMessage::JoinAck => {}
         ControlMessage::Error { message } => bail!("{message}"),
         other => bail!("unexpected push response: {other:?}"),
@@ -474,7 +473,7 @@ async fn run_worker(
         return Ok(());
     }
 
-    let (mut stream, _) = connect_and_handshake(target, port).await?;
+    let (mut stream, _, _) = connect_and_handshake(target, port).await?;
     send_control(
         &mut stream,
         &ControlMessage::JoinSession {
@@ -713,7 +712,7 @@ pub async fn connect_interactive(
         );
     }
 
-    let (stream, device) = loop {
+    let (stream, device, _) = loop {
         print!(
             "\n  {} select receiver (1-{}) or 0 to quit: ",
             console::style("▶").yellow().bold(),
@@ -748,7 +747,7 @@ pub async fn connect_interactive(
 }
 
 async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
-    let (mut stream, device) = connect_and_handshake(target, port).await?;
+    let (mut stream, device, _) = connect_and_handshake(target, port).await?;
     ui::success(&format!(
         "connected to {} ({} {}, protocol {})",
         ui::bold(&device.host_name),
@@ -848,10 +847,12 @@ async fn connect_with_timeout(addr: &str) -> Result<TcpStream> {
     }
 }
 
+/// Returns the stream, the server's device info, and whether the server
+/// requires a pairing code for write operations.
 pub(crate) async fn connect_and_handshake(
     target: &str,
     port: u16,
-) -> Result<(TcpStream, crate::protocol::DeviceInfo)> {
+) -> Result<(TcpStream, crate::protocol::DeviceInfo, bool)> {
     let addr = format!("{target}:{port}");
     let mut stream = connect_with_timeout(&addr).await?;
     stream.set_nodelay(true)?;
@@ -867,12 +868,12 @@ pub(crate) async fn connect_and_handshake(
     )
     .await?;
 
-    match read_control(&mut stream).await? {
+    match read_control_timeout(&mut stream, std::time::Duration::from_secs(5)).await? {
         ControlMessage::HelloAck {
             version,
             server,
-            auth_required: _,
-        } if version == PROTOCOL_VERSION => Ok((stream, server)),
+            auth_required,
+        } if version == PROTOCOL_VERSION => Ok((stream, server, auth_required)),
         ControlMessage::HelloAck { version, .. } => {
             bail!("server protocol version mismatch: {version}")
         }
@@ -977,155 +978,4 @@ fn default_jobs(unit_count: usize) -> usize {
         .map(|v| v.get())
         .unwrap_or(4);
     usize::min(unit_count, usize::min(8, usize::max(2, cpu)))
-}
-
-/// Summary of an incoming file transfer session.
-pub struct ReceiveSummary {
-    pub files_received: usize,
-    pub bytes: u64,
-    pub errors: Vec<String>,
-}
-
-/// Handle an incoming file transfer session. Called when the server sends
-/// a BeginSession to our server. We create a temporary listener, tell the
-/// server our port via JoinSession, accept the data connection, and
-/// process incoming files.
-pub async fn receive_session(
-    session_id: &str,
-    server_ip: &str,
-    data_port: u16,
-    files: &[FileSpec],
-) -> Result<ReceiveSummary> {
-    use crate::protocol::ControlMessage as CM;
-    use tokio::net::TcpListener;
-    use tokio::io::BufReader;
-
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
-    let local_port = listener.local_addr()?.port();
-
-    // Connect back to the server's control connection to send JoinSession.
-    let mut control =
-        connect_with_timeout(&format!("{server_ip}:{data_port}")).await?;
-    control.set_nodelay(true)?;
-    tune_socket(&control);
-
-    // Handshake.
-    send_control(
-        &mut control,
-        &CM::Hello {
-            version: PROTOCOL_VERSION,
-            client_name: util::host_name(),
-            client_port: local_port,
-        },
-    )
-    .await?;
-    match read_control(&mut control).await? {
-        CM::HelloAck { version, .. } if version == PROTOCOL_VERSION => {}
-        CM::HelloAck { version, .. } => bail!("version mismatch: {version}"),
-        CM::Error { message } => bail!("{message}"),
-        other => bail!("unexpected handshake: {other:?}"),
-    }
-
-    // Join the session.
-    send_control(
-        &mut control,
-        &CM::JoinSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .await?;
-    match read_control(&mut control).await? {
-        CM::JoinAck => {}
-        CM::Error { message } => bail!("{message}"),
-        other => bail!("unexpected join response: {other:?}"),
-    }
-
-    // Drop the control connection — the server will connect to our listener.
-    drop(control);
-
-    // Accept the data connection from the server.
-    let (data_stream, _peer) = listener.accept().await?;
-    let mut reader = BufReader::with_capacity(4 * 1024_1024, data_stream);
-
-    // Build a quick lookup for file metadata.
-    let file_map: HashMap<u32, &FileSpec> = files.iter().map(|f| (f.id, f)).collect();
-
-    let mut summary = ReceiveSummary {
-        files_received: 0,
-        bytes: 0,
-        errors: Vec::new(),
-    };
-
-    // Process incoming data units.
-    loop {
-        let msg = match read_control(&mut reader).await {
-            Ok(msg) => msg,
-            Err(_) => break, // sender closed the connection
-        };
-        match msg {
-            CM::SendFile { id, offset, len } => {
-                let spec = match file_map.get(&id) {
-                    Some(s) => s,
-                    None => {
-                        summary.errors.push(format!("unknown file id {id}"));
-                        break;
-                    }
-                };
-
-                // Determine local path for this file.
-                let dest = std::path::PathBuf::from(&spec.rel_path);
-                if let Some(parent) = dest.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-
-                // Write the incoming data.
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(offset == 0)
-                    .open(&dest)
-                    .await?;
-                file.seek(std::io::SeekFrom::Start(offset)).await?;
-
-                let mut remaining = len;
-                let mut buf = vec![0u8; 4 * 1024 * 1024];
-                let mut hasher = blake3::Hasher::new();
-                while remaining > 0 {
-                    let to_read = usize::min(remaining as usize, buf.len());
-                    reader
-                        .read_exact(&mut buf[..to_read])
-                        .await
-                        .map_err(|e| anyhow!("data read error: {e}"))?;
-                    hasher.update(&buf[..to_read]);
-                    file.write_all(&buf[..to_read]).await?;
-                    remaining -= to_read as u64;
-                }
-                file.flush().await?;
-                drop(file);
-
-                let hash = hasher.finalize().to_hex().to_string();
-                summary.bytes += len;
-                summary.files_received += 1;
-
-                // Report success back to the server.
-                let _ = send_control(
-                    &mut reader.get_mut(),
-                    &CM::FileDone {
-                        id,
-                        hash,
-                        ok: true,
-                        error: None,
-                    },
-                )
-                .await;
-            }
-            CM::Error { message } => {
-                summary.errors.push(message);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(summary)
 }

@@ -86,7 +86,10 @@ async fn run(cli: Cli) -> Result<()> {
                 &details,
                 "Ctrl-C  stop",
             )?;
-            server::run_server(bind, discovery_port, code, false, !open, None).await?;
+            let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
+                anyhow::anyhow!("cannot listen on {bind}: {e} (another lanxfer running?)")
+            })?;
+            server::run_server(listener, discovery_port, code, false, !open, None).await?;
         }
         Some(Command::Discover {
             discovery_port,

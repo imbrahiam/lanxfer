@@ -5,7 +5,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
 use std::io::IsTerminal;
-use std::time::Duration;
 
 // Keep the surface on the terminal's own background. Hard-coded RGB
 // backgrounds render inconsistently in terminals without true-color support
@@ -65,72 +64,9 @@ impl StatusScreen {
         help: &str,
     ) -> Result<Option<usize>> {
         if let Some(terminal) = &mut self.terminal {
-            run(terminal, title, &items, start, help)
+            choose_loop(terminal, title, &items, start, help)
         } else {
             Ok(items.get(start).map(|_| start))
-        }
-    }
-
-    /// Non-blocking version of `choose`. Renders the UI and returns immediately.
-    ///
-    /// Also mutates `selected`, `query` in-place for navigation/filtering.
-    pub fn try_choose(
-        &mut self,
-        title: &str,
-        items: &[String],
-        visible: &[usize],
-        selected: &mut usize,
-        query: &mut String,
-        help: &str,
-    ) -> Result<Option<Option<usize>>> {
-        if let Some(terminal) = &mut self.terminal {
-            terminal.draw(|frame| draw(frame, title, items, visible, *selected, query, help))?;
-            if !event::poll(Duration::ZERO)? {
-                return Ok(None);
-            }
-            let Event::Key(key) = event::read()? else {
-                return Ok(None);
-            };
-            if key.kind != KeyEventKind::Press {
-                return Ok(None);
-            }
-            match key.code {
-                KeyCode::Esc => Ok(Some(None)),
-                KeyCode::Enter if !visible.is_empty() => Ok(Some(Some(visible[*selected]))),
-                KeyCode::Up | KeyCode::Char('k') if query.is_empty() => {
-                    *selected = selected.saturating_sub(1);
-                    Ok(None)
-                }
-                KeyCode::Down | KeyCode::Char('j') if query.is_empty() => {
-                    *selected = (*selected + 1).min(visible.len().saturating_sub(1));
-                    Ok(None)
-                }
-                KeyCode::Home => {
-                    *selected = 0;
-                    Ok(None)
-                }
-                KeyCode::End => {
-                    *selected = visible.len().saturating_sub(1);
-                    Ok(None)
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                    *selected = 0;
-                    Ok(None)
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    query.push(c);
-                    *selected = 0;
-                    Ok(None)
-                }
-                _ => Ok(None),
-            }
-        } else {
-            Ok(Some(items.get(*selected).map(|_| *selected)))
         }
     }
 
@@ -153,6 +89,9 @@ impl StatusScreen {
             };
             if key.kind != KeyEventKind::Press {
                 continue;
+            }
+            if is_ctrl_c(&key) {
+                quit_app();
             }
             match key.code {
                 KeyCode::Esc => return Ok(None),
@@ -180,9 +119,13 @@ impl StatusScreen {
             let Event::Key(key) = event::read()? else {
                 continue;
             };
-            if key.kind == KeyEventKind::Press
-                && matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
-            {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if is_ctrl_c(&key) {
+                quit_app();
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                 return Ok(());
             }
         }
@@ -212,7 +155,22 @@ impl Drop for StatusScreen {
     }
 }
 
-fn run(
+/// Ctrl+C arrives as a key event in raw mode, not SIGINT — honor it
+/// anywhere the UI is reading keys, restoring the terminal first.
+fn quit_app() -> ! {
+    ratatui::restore();
+    let _ = console::Term::stdout().show_cursor();
+    std::process::exit(0)
+}
+
+fn is_ctrl_c(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Char('c')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+}
+
+fn choose_loop(
     terminal: &mut ratatui::DefaultTerminal,
     title: &str,
     items: &[String],
@@ -228,34 +186,74 @@ fn run(
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
+        match handle_list_key(&key, items, &mut selected, &mut query) {
+            KeyOutcome::Pick(index) => return Ok(Some(index)),
+            KeyOutcome::Cancel => return Ok(None),
+            KeyOutcome::Handled | KeyOutcome::Ignored => {}
         }
-        match key.code {
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Enter if !visible.is_empty() => return Ok(Some(visible[selected])),
-            KeyCode::Up | KeyCode::Char('k') if query.is_empty() => {
-                selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') if query.is_empty() => {
-                selected = (selected + 1).min(visible.len().saturating_sub(1));
-            }
-            KeyCode::Home => selected = 0,
-            KeyCode::End => selected = visible.len().saturating_sub(1),
-            KeyCode::Backspace => {
-                query.pop();
-                selected = 0;
-            }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
-                query.push(c);
-                selected = 0;
-            }
-            _ => {}
+    }
+}
+
+pub(crate) enum KeyOutcome {
+    /// Enter — index into the full item list.
+    Pick(usize),
+    /// Esc.
+    Cancel,
+    /// Navigation or filter state changed — redraw needed.
+    Handled,
+    Ignored,
+}
+
+/// Shared keyboard handling for every filterable list in the app.
+pub(crate) fn handle_list_key(
+    key: &crossterm::event::KeyEvent,
+    items: &[String],
+    selected: &mut usize,
+    query: &mut String,
+) -> KeyOutcome {
+    if key.kind != KeyEventKind::Press {
+        return KeyOutcome::Ignored;
+    }
+    if is_ctrl_c(key) {
+        quit_app();
+    }
+    let visible = filtered(items, query);
+    match key.code {
+        KeyCode::Esc => KeyOutcome::Cancel,
+        KeyCode::Enter if !visible.is_empty() => {
+            KeyOutcome::Pick(visible[(*selected).min(visible.len() - 1)])
         }
+        KeyCode::Up | KeyCode::Char('k') if query.is_empty() => {
+            *selected = selected.saturating_sub(1);
+            KeyOutcome::Handled
+        }
+        KeyCode::Down | KeyCode::Char('j') if query.is_empty() => {
+            *selected = (*selected + 1).min(visible.len().saturating_sub(1));
+            KeyOutcome::Handled
+        }
+        KeyCode::Home => {
+            *selected = 0;
+            KeyOutcome::Handled
+        }
+        KeyCode::End => {
+            *selected = visible.len().saturating_sub(1);
+            KeyOutcome::Handled
+        }
+        KeyCode::Backspace => {
+            query.pop();
+            *selected = 0;
+            KeyOutcome::Handled
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            query.push(c);
+            *selected = 0;
+            KeyOutcome::Handled
+        }
+        _ => KeyOutcome::Ignored,
     }
 }
 
@@ -544,6 +542,10 @@ fn draw(
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    // Never exceed the frame — rendering outside the buffer panics ratatui
+    // (tiny terminals, mid-resize).
+    let width = width.min(area.width);
+    let height = height.min(area.height);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
