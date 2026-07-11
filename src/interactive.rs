@@ -26,6 +26,7 @@ pub struct TransferRecord {
 }
 
 /// Events sent from the server task to the interactive UI.
+#[allow(dead_code)]
 pub enum ServerEvent {
     /// A new client connected — stream, client name, client port, client IP.
     PeerConnected(TcpStream, String, u16, String),
