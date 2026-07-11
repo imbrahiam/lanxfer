@@ -37,6 +37,16 @@ impl StatusScreen {
         })
     }
 
+    /// Drop the TUI and restore the terminal to normal mode. After this,
+    /// plain println! works as expected. The StatusScreen becomes a no-op
+    /// (renders nothing) until dropped.
+    pub fn suspend(&mut self) {
+        if self.terminal.is_some() {
+            ratatui::restore();
+            self.terminal = None;
+        }
+    }
+
     pub fn render(
         &mut self,
         title: &str,
