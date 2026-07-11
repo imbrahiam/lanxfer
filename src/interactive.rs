@@ -1121,7 +1121,7 @@ async fn pick_remote_files(
             &prompt,
             items.clone(),
             last_idx.min(items.len().saturating_sub(1)),
-            "space select · enter open dir / confirm · esc up",
+            "space/enter select · enter dir · esc up",
         )?;
 
         let to_specs = |files: Vec<(String, String, u64, i64)>| -> Vec<RemoteFileSpec> {
@@ -1191,13 +1191,14 @@ async fn pick_remote_files(
                     }
                     last_idx = 0;
                 } else {
-                    // Enter on a file confirms — include it if not selected.
+                    // Enter on a file toggles selection
                     let rel = join_remote_path(&current_relative, &entry.name);
-                    if !selected_files.iter().any(|(_, r, _, _)| *r == rel) {
+                    if let Some(pos) = selected_files.iter().position(|(_, r, _, _)| *r == rel) {
+                        selected_files.remove(pos);
+                    } else {
                         let abs = join_remote_path(&dest_root, &rel);
                         selected_files.push((abs, rel, entry.size, entry.mtime_secs));
                     }
-                    return Ok(Some((to_specs(selected_files), auth_code)));
                 }
             }
         }
@@ -1598,8 +1599,8 @@ fn pick_start_dir(screen: &mut crate::picker::StatusScreen) -> Result<Option<Pat
 }
 
 /// Navigate directories and toggle files/folders for transfer:
-/// - selecting a directory enters it
-/// - selecting a file toggles it
+/// - Space or Enter on a directory enters it
+/// - Space or Enter on a file toggles selection
 /// - "Add this whole folder" toggles the current directory
 /// - "Done" confirms; Esc goes up / backs out
 ///
@@ -1686,7 +1687,7 @@ fn pick_local_paths(screen: &mut crate::picker::StatusScreen) -> Result<Option<V
             &prompt,
             items.clone(),
             last_idx.min(items.len() - 1),
-            "space select · enter open dir / confirm · esc up",
+            "space/enter select · enter dir · esc up",
         )?;
 
         match choice {
@@ -1742,11 +1743,8 @@ fn pick_local_paths(screen: &mut crate::picker::StatusScreen) -> Result<Option<V
                             current_dir = path.clone();
                             last_idx = 0;
                         } else {
-                            // Enter on a file confirms — include it if needed.
-                            if !selected.contains(path) {
-                                selected.push(path.clone());
-                            }
-                            return Ok(Some(selected));
+                            // Enter on a file toggles selection
+                            toggle(&mut selected, path);
                         }
                     }
                 }
