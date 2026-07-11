@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -383,7 +383,64 @@ async fn peer_session(
     codes: &mut HashMap<String, String>,
     transfers: &mut Vec<TransferRecord>,
 ) -> Result<bool> {
-    let (_device, auth_required) = handshake_info(ip, port).await?;
+    use tokio::io::BufReader;
+
+    // Persistent connection to the peer's server.
+    let addr = format!("{ip}:{port}");
+    let mut stream = tokio::net::TcpStream::connect(&addr).await?;
+    stream.set_nodelay(true)?;
+
+    // Handshake.
+    send_control(
+        &mut stream,
+        &ControlMessage::Hello {
+            version: PROTOCOL_VERSION,
+            client_name: util::host_name(),
+            client_port: 0, // not relevant for outgoing sessions
+        },
+    )
+    .await?;
+    let (device, auth_required) = match read_control(&mut stream).await? {
+        ControlMessage::HelloAck {
+            version,
+            server,
+            auth_required,
+        } if version == PROTOCOL_VERSION => (server, auth_required),
+        ControlMessage::HelloAck { version, .. } => bail!("version mismatch: {version}"),
+        ControlMessage::Error { message } => bail!("{message}"),
+        other => bail!("unexpected handshake: {other:?}"),
+    };
+    let _ = device;
+
+    // Split for concurrent read/write.
+    let (read_half, write_half) = stream.into_split();
+    let reader = BufReader::with_capacity(4 * 1024 * 1024, read_half);
+
+    // Channel: reader task → UI.
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    // Channel: UI → writer task.
+    let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ControlMessage>();
+
+    // Reader task.
+    tokio::spawn(async move {
+        let mut reader = reader;
+        while let Ok(msg) = read_control(&mut reader).await {
+            let _ = msg_tx.send(msg);
+        }
+        let _ = msg_tx.send(ControlMessage::Error {
+            message: "connection closed".to_string(),
+        });
+    });
+
+    // Writer task.
+    let mut write_half = write_half;
+    tokio::spawn(async move {
+        while let Some(msg) = cmd_rx.recv().await {
+            if send_control(&mut write_half, &msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let mut last_dest: Option<String> = None;
     let mut last_source: Option<String> = None;
@@ -416,17 +473,107 @@ async fn peer_session(
         menu.push(("Quit".to_string(), Action::Quit));
 
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
-        let Some(sel) = select(
-            screen,
-            &format!("{label} · what next?"),
-            labels,
-            0,
-            "↑↓ move · enter select · esc switch peer",
-        )?
-        else {
-            return Ok(false); // esc = back to peer list
+        let nav_help = "↑↓ move · type to filter · enter select · esc back";
+
+        // Non-blocking event loop: processes keyboard input AND incoming messages.
+        let mut query = String::new();
+        let mut selected = 0usize;
+        let sel: Option<usize> = loop {
+            let visible = filtered(&labels, &query);
+            selected = selected.min(visible.len().saturating_sub(1));
+
+            match screen.try_choose(
+                &format!("{label} · what next?"),
+                &labels,
+                &visible,
+                &mut selected,
+                &mut query,
+                nav_help,
+            )? {
+                Some(Some(idx)) => break Some(idx),
+                Some(None) => return Ok(false), // esc = back to peer list
+                None => {}                       // no input — check messages
+            }
+
+            // Check for incoming messages (BeginSession from server, etc.).
+            while let Ok(msg) = msg_rx.try_recv() {
+                match msg {
+                    ControlMessage::BeginSession {
+                        destination_path,
+                        auth_code: _,
+                        overwrite: _,
+                        dry_run: _,
+                        files,
+                        dirs: _,
+                    } => {
+                        // Server is sending files to us. Wait for SessionPlan
+                        // (already sent by the server, should be in the channel).
+                        let mut session_id = String::new();
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while Instant::now() < deadline {
+                            if let Ok(ControlMessage::SessionPlan {
+                                session_id: sid,
+                                actions: _,
+                            }) = msg_rx.try_recv()
+                            {
+                                session_id = sid;
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+
+                        let screen_title = format!("Receiving from {label}");
+                        screen.render(
+                            &screen_title,
+                            &format!("{} files incoming…", files.len()),
+                            crate::picker::Tone::Info,
+                            &[("destination".into(), destination_path)],
+                            "accepting transfer…",
+                        )?;
+
+                        let server_ip = ip.to_string();
+                        let data_port = port;
+                        let files_clone = files.clone();
+                        let sid = session_id.clone();
+                        tokio::spawn(async move {
+                            match client::receive_session(&sid, &server_ip, data_port, &files_clone)
+                                .await
+                            {
+                                Ok(s) => {
+                                    eprintln!(
+                                        "received {} files ({} bytes)",
+                                        s.files_received, s.bytes
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("receive failed: {e:#}");
+                                }
+                            }
+                        });
+                    }
+                    ControlMessage::Error { message }
+                        if message == "connection closed" => {
+                            screen.render(
+                                "Disconnected",
+                                &format!("Peer {label} disconnected"),
+                                crate::picker::Tone::Info,
+                                &[],
+                                "returning to peer list…",
+                            )?;
+                            tokio::time::sleep(Duration::from_millis(600)).await;
+                            return Ok(false);
+                        }
+                    _ => {}
+                }
+            }
+
+            // Small sleep to avoid busy-waiting.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
+        let Some(sel) = sel else {
+            unreachable!()
+        };
         let result = match &menu[sel].1 {
             Action::Send => {
                 send_flow(
@@ -506,33 +653,6 @@ async fn peer_session(
                 codes.remove(ip);
             }
         }
-    }
-}
-
-async fn handshake_info(ip: &str, port: u16) -> Result<(crate::protocol::DeviceInfo, bool)> {
-    let addr = format!("{ip}:{port}");
-    let mut s = tokio::net::TcpStream::connect(&addr).await?;
-    s.set_nodelay(true)?;
-    send_control(
-        &mut s,
-        &ControlMessage::Hello {
-            version: PROTOCOL_VERSION,
-            client_name: util::host_name(),
-            client_port: port,
-        },
-    )
-    .await?;
-    match read_control(&mut s).await? {
-        ControlMessage::HelloAck {
-            version,
-            server,
-            auth_required,
-        } if version == PROTOCOL_VERSION => Ok((server, auth_required)),
-        ControlMessage::HelloAck { version, .. } => {
-            bail!("protocol version mismatch: {version}")
-        }
-        ControlMessage::Error { message } => bail!("{message}"),
-        other => bail!("unexpected handshake response: {other:?}"),
     }
 }
 

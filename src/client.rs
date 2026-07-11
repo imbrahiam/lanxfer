@@ -17,6 +17,7 @@ use crate::protocol::{
 };
 use crate::ui;
 use crate::util;
+use tokio::fs::OpenOptions;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DirectoryEntry {
@@ -963,4 +964,154 @@ fn default_jobs(unit_count: usize) -> usize {
         .map(|v| v.get())
         .unwrap_or(4);
     usize::min(unit_count, usize::min(8, usize::max(2, cpu)))
+}
+
+/// Summary of an incoming file transfer session.
+pub struct ReceiveSummary {
+    pub files_received: usize,
+    pub bytes: u64,
+    pub errors: Vec<String>,
+}
+
+/// Handle an incoming file transfer session. Called when the server sends
+/// a BeginSession to our server. We create a temporary listener, tell the
+/// server our port via JoinSession, accept the data connection, and
+/// process incoming files.
+pub async fn receive_session(
+    session_id: &str,
+    server_ip: &str,
+    data_port: u16,
+    files: &[FileSpec],
+) -> Result<ReceiveSummary> {
+    use crate::protocol::ControlMessage as CM;
+    use tokio::net::TcpListener;
+    use tokio::io::BufReader;
+
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let local_port = listener.local_addr()?.port();
+
+    // Connect back to the server's control connection to send JoinSession.
+    let mut control = TcpStream::connect(format!("{server_ip}:{data_port}")).await?;
+    control.set_nodelay(true)?;
+    tune_socket(&control);
+
+    // Handshake.
+    send_control(
+        &mut control,
+        &CM::Hello {
+            version: PROTOCOL_VERSION,
+            client_name: util::host_name(),
+            client_port: local_port,
+        },
+    )
+    .await?;
+    match read_control(&mut control).await? {
+        CM::HelloAck { version, .. } if version == PROTOCOL_VERSION => {}
+        CM::HelloAck { version, .. } => bail!("version mismatch: {version}"),
+        CM::Error { message } => bail!("{message}"),
+        other => bail!("unexpected handshake: {other:?}"),
+    }
+
+    // Join the session.
+    send_control(
+        &mut control,
+        &CM::JoinSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
+    match read_control(&mut control).await? {
+        CM::JoinAck => {}
+        CM::Error { message } => bail!("{message}"),
+        other => bail!("unexpected join response: {other:?}"),
+    }
+
+    // Drop the control connection — the server will connect to our listener.
+    drop(control);
+
+    // Accept the data connection from the server.
+    let (data_stream, _peer) = listener.accept().await?;
+    let mut reader = BufReader::with_capacity(4 * 1024_1024, data_stream);
+
+    // Build a quick lookup for file metadata.
+    let file_map: HashMap<u32, &FileSpec> = files.iter().map(|f| (f.id, f)).collect();
+
+    let mut summary = ReceiveSummary {
+        files_received: 0,
+        bytes: 0,
+        errors: Vec::new(),
+    };
+
+    // Process incoming data units.
+    loop {
+        let msg = match read_control(&mut reader).await {
+            Ok(msg) => msg,
+            Err(_) => break, // sender closed the connection
+        };
+        match msg {
+            CM::SendFile { id, offset, len } => {
+                let spec = match file_map.get(&id) {
+                    Some(s) => s,
+                    None => {
+                        summary.errors.push(format!("unknown file id {id}"));
+                        break;
+                    }
+                };
+
+                // Determine local path for this file.
+                let dest = std::path::PathBuf::from(&spec.rel_path);
+                if let Some(parent) = dest.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+
+                // Write the incoming data.
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(offset == 0)
+                    .open(&dest)
+                    .await?;
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+
+                let mut remaining = len;
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                let mut hasher = blake3::Hasher::new();
+                while remaining > 0 {
+                    let to_read = usize::min(remaining as usize, buf.len());
+                    reader
+                        .read_exact(&mut buf[..to_read])
+                        .await
+                        .map_err(|e| anyhow!("data read error: {e}"))?;
+                    hasher.update(&buf[..to_read]);
+                    file.write_all(&buf[..to_read]).await?;
+                    remaining -= to_read as u64;
+                }
+                file.flush().await?;
+                drop(file);
+
+                let hash = hasher.finalize().to_hex().to_string();
+                summary.bytes += len;
+                summary.files_received += 1;
+
+                // Report success back to the server.
+                let _ = send_control(
+                    &mut reader.get_mut(),
+                    &CM::FileDone {
+                        id,
+                        hash,
+                        ok: true,
+                        error: None,
+                    },
+                )
+                .await;
+            }
+            CM::Error { message } => {
+                summary.errors.push(message);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
 }

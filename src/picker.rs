@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
 use std::io::IsTerminal;
+use std::time::Duration;
 
 // Keep the surface on the terminal's own background. Hard-coded RGB
 // backgrounds render inconsistently in terminals without true-color support
@@ -67,6 +68,69 @@ impl StatusScreen {
             run(terminal, title, &items, start, help)
         } else {
             Ok(items.get(start).map(|_| start))
+        }
+    }
+
+    /// Non-blocking version of `choose`. Renders the UI and returns immediately.
+    ///
+    /// Also mutates `selected`, `query` in-place for navigation/filtering.
+    pub fn try_choose(
+        &mut self,
+        title: &str,
+        items: &[String],
+        visible: &[usize],
+        selected: &mut usize,
+        query: &mut String,
+        help: &str,
+    ) -> Result<Option<Option<usize>>> {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.draw(|frame| draw(frame, title, items, visible, *selected, query, help))?;
+            if !event::poll(Duration::ZERO)? {
+                return Ok(None);
+            }
+            let Event::Key(key) = event::read()? else {
+                return Ok(None);
+            };
+            if key.kind != KeyEventKind::Press {
+                return Ok(None);
+            }
+            match key.code {
+                KeyCode::Esc => Ok(Some(None)),
+                KeyCode::Enter if !visible.is_empty() => Ok(Some(Some(visible[*selected]))),
+                KeyCode::Up | KeyCode::Char('k') if query.is_empty() => {
+                    *selected = selected.saturating_sub(1);
+                    Ok(None)
+                }
+                KeyCode::Down | KeyCode::Char('j') if query.is_empty() => {
+                    *selected = (*selected + 1).min(visible.len().saturating_sub(1));
+                    Ok(None)
+                }
+                KeyCode::Home => {
+                    *selected = 0;
+                    Ok(None)
+                }
+                KeyCode::End => {
+                    *selected = visible.len().saturating_sub(1);
+                    Ok(None)
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                    Ok(None)
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    query.push(c);
+                    *selected = 0;
+                    Ok(None)
+                }
+                _ => Ok(None),
+            }
+        } else {
+            Ok(Some(items.get(*selected).map(|_| *selected)))
         }
     }
 
