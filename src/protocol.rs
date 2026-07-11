@@ -149,8 +149,9 @@ pub enum ControlMessage {
         error: Option<String>,
     },
 
-    /// Ask the remote to push these files to us.
-    /// Remote reads files from its own disk, connects back to
+    /// Ask the remote to push these selected paths to us. Paths may be files
+    /// or directories; directories are scanned recursively by the remote.
+    /// Remote reads paths from its own disk, connects back to
     /// requester's server, and acts as the sender.
     PushRequest {
         files: Vec<RemoteFileSpec>,

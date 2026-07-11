@@ -864,7 +864,9 @@ async fn handle_push_request(
         .map(|f| PathBuf::from(&f.abs_path))
         .collect();
 
-    // Verify all files exist before starting the transfer.
+    // Verify all selected paths exist before starting the transfer. Sources
+    // may be files or directories; send_session recursively scans directories
+    // into the normal resumable manifest.
     for path in &sources {
         if !path.exists() {
             let _ = send_control(
@@ -878,13 +880,13 @@ async fn handle_push_request(
             .await;
             return Ok(());
         }
-        if !path.is_file() {
+        if !path.is_file() && !path.is_dir() {
             let _ = send_control(
                 &mut stream,
                 &ControlMessage::PushComplete {
                     files_sent: 0,
                     bytes: 0,
-                    errors: vec![format!("not a file: {}", path.display())],
+                    errors: vec![format!("not a file or directory: {}", path.display())],
                 },
             )
             .await;
@@ -937,7 +939,7 @@ mod tests {
     /// Full pull round-trip over localhost: requester B (auth on) registers a
     /// one-time token, remote A pushes the file back authenticating with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pull_round_trip_uses_one_time_token() -> Result<()> {
+    async fn pull_directory_round_trip_uses_one_time_token() -> Result<()> {
         let base =
             std::env::temp_dir().join(format!("lanxfer-pull-{}", uuid::Uuid::new_v4().simple()));
         let src = base.join("src");
@@ -946,6 +948,9 @@ mod tests {
         std::fs::create_dir_all(&dst)?;
         let file = src.join("hello.txt");
         std::fs::write(&file, b"pull me")?;
+        std::fs::create_dir_all(src.join("nested"))?;
+        std::fs::write(src.join("nested/world.txt"), b"recursively")?;
+        std::fs::create_dir_all(src.join("empty"))?;
 
         // Peer A: owns the file, open (no auth).
         let a = TcpListener::bind("127.0.0.1:0").await?;
@@ -979,9 +984,9 @@ mod tests {
 
         let spec = RemoteFileSpec {
             id: 0,
-            abs_path: file.to_string_lossy().into_owned(),
-            rel_path: "hello.txt".into(),
-            size: 7,
+            abs_path: src.to_string_lossy().into_owned(),
+            rel_path: "src".into(),
+            size: 0,
             mtime_secs: 0,
         };
         let summary = client::pull_session(
@@ -996,8 +1001,13 @@ mod tests {
         )
         .await?;
         assert!(summary.errors.is_empty(), "{:?}", summary.errors);
-        assert_eq!(summary.transferred, 1);
-        assert_eq!(std::fs::read(dst.join("hello.txt"))?, b"pull me");
+        assert_eq!(summary.transferred, 2);
+        assert_eq!(std::fs::read(dst.join("src/hello.txt"))?, b"pull me");
+        assert_eq!(
+            std::fs::read(dst.join("src/nested/world.txt"))?,
+            b"recursively"
+        );
+        assert!(dst.join("src/empty").is_dir());
         assert!(tokens.lock().unwrap().is_empty(), "token not consumed");
 
         // Without a token the write-back must be rejected by B's server.

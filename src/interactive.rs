@@ -865,7 +865,7 @@ async fn send_flow(
             // browsing/writing will.
             let (destinations, needs_auth) = fetch_destinations(ip, port).await?;
             *auth_required = needs_auth;
-            let Some(code) = ensure_code(screen, ip, needs_auth, codes)? else {
+            let Some(mut code) = ensure_code(screen, ip, needs_auth, codes)? else {
                 return Ok(());
             };
             let writable: Vec<&DestinationInfo> =
@@ -891,8 +891,16 @@ async fn send_flow(
                 return Ok(());
             };
 
-            match browse_remote_dir(screen, ip, port, &writable[drive_idx].path, code.as_deref())
-                .await?
+            match browse_remote_dir(
+                screen,
+                ip,
+                port,
+                &writable[drive_idx].path,
+                &mut code,
+                needs_auth,
+                codes,
+            )
+            .await?
             {
                 Some(path) => (path, code),
                 None => return Ok(()),
@@ -1030,7 +1038,7 @@ async fn pick_remote_files(
     // First: pick a starting drive.
     let (destinations, needs_auth) = fetch_destinations(ip, port).await?;
     *auth_required = needs_auth;
-    let Some(auth_code) = ensure_code(screen, ip, needs_auth, codes)? else {
+    let Some(mut auth_code) = ensure_code(screen, ip, needs_auth, codes)? else {
         return Ok(None);
     };
     let writable: Vec<&DestinationInfo> = destinations.iter().filter(|d| !d.read_only).collect();
@@ -1080,6 +1088,14 @@ async fn pick_remote_files(
 
         let entries = match read_control_timeout(&mut stream, REPLY_TIMEOUT).await? {
             ControlMessage::DirectoryContents { entries, .. } => entries,
+            ControlMessage::Error { message } if message.contains("pairing code") => {
+                codes.remove(ip);
+                let Some(code) = ensure_code(screen, ip, needs_auth, codes)? else {
+                    return Ok(None);
+                };
+                auth_code = code;
+                continue;
+            }
             ControlMessage::Error { message } => bail!("{message}"),
             _ => bail!("unexpected response"),
         };
@@ -1088,7 +1104,7 @@ async fn pick_remote_files(
         let done_label = if selected_files.is_empty() {
             "✓ Done (nothing selected — cancels)".to_string()
         } else {
-            format!("✓ Done — receive {} file(s)", selected_files.len())
+            format!("✓ Done — receive {} item(s)", selected_files.len())
         };
 
         let mut items = vec![done_label, ".. go up".to_string()];
@@ -1236,7 +1252,7 @@ async fn receive_flow(
 
     if !confirm(
         screen,
-        &format!("Receive {} file(s) to {}?", remote_files.len(), local_dest),
+        &format!("Receive {} item(s) to {}?", remote_files.len(), local_dest),
         true,
     )? {
         return Ok(());
@@ -1338,47 +1354,63 @@ async fn receive_flow(
 
 /// Pick a local directory to save received files into.
 fn pick_local_save_dir(screen: &mut crate::picker::StatusScreen) -> Result<Option<String>> {
-    let home = dirs::home_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let desktop = dirs::desktop_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let downloads = dirs::download_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let documents = dirs::document_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-
-    let mut options: Vec<(String, String)> = Vec::new();
-    if !home.is_empty() {
-        options.push((format!("Home      {home}"), home.clone()));
-    }
-    if !desktop.is_empty() {
-        options.push((format!("Desktop   {desktop}"), desktop));
-    }
-    if !downloads.is_empty() {
-        options.push((format!("Downloads {downloads}"), downloads));
-    }
-    if !documents.is_empty() {
-        options.push((format!("Documents {documents}"), documents));
-    }
-    options.push(("Enter path manually".to_string(), String::new()));
-
-    let labels: Vec<String> = options.iter().map(|(l, _)| l.clone()).collect();
-    let Some(idx) = select(screen, "Save to (local)", labels, 0, NAV_HELP)? else {
+    let Some(start) = pick_start_dir(screen)? else {
         return Ok(None);
     };
+    browse_local_save_dir(screen, start)
+}
 
-    if options[idx].1.is_empty() {
-        // Manual entry
-        match input_text(screen, "Local path", "esc to go back", false)? {
-            Some(path) => Ok(Some(path.trim().to_string())),
-            None => Ok(None),
+fn browse_local_save_dir(
+    screen: &mut crate::picker::StatusScreen,
+    mut current_dir: PathBuf,
+) -> Result<Option<String>> {
+    let mut last_idx = 0;
+    loop {
+        if !current_dir.is_dir() {
+            bail!("destination is not a directory: {}", current_dir.display());
         }
-    } else {
-        Ok(Some(options[idx].1.clone()))
+
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(&current_dir)?.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with('.') {
+                    dirs.push((name, entry.path()));
+                }
+            }
+        }
+        dirs.sort_by_key(|entry| entry.0.to_lowercase());
+
+        let mut items = vec!["✓ Use this folder".to_string(), ".. go up".to_string()];
+        items.extend(dirs.iter().map(|(name, _)| format!("{name}/")));
+        let Some(idx) = select(
+            screen,
+            &format!("Save to · {}", current_dir.display()),
+            items.clone(),
+            last_idx.min(items.len() - 1),
+            NAV_HELP,
+        )?
+        else {
+            return Ok(None);
+        };
+        match idx {
+            0 => return Ok(Some(current_dir.to_string_lossy().into_owned())),
+            1 => {
+                if let Some(parent) = current_dir.parent() {
+                    current_dir = parent.to_path_buf();
+                } else if cfg!(windows) {
+                    let Some(drive) = pick_windows_drive(screen)? else {
+                        return Ok(None);
+                    };
+                    current_dir = drive;
+                }
+                last_idx = 0;
+            }
+            i => {
+                current_dir = dirs[i - 2].1.clone();
+                last_idx = 0;
+            }
+        }
     }
 }
 
@@ -1430,7 +1462,9 @@ async fn browse_remote_dir(
     ip: &str,
     port: u16,
     dest_root: &str,
-    auth_code: Option<&str>,
+    auth_code: &mut Option<String>,
+    auth_required: bool,
+    codes: &mut HashMap<String, String>,
 ) -> Result<Option<String>> {
     // One connection for the whole browse session — no reconnect per step.
     let (mut stream, _, _) = client::connect_and_handshake(ip, port).await?;
@@ -1443,13 +1477,21 @@ async fn browse_remote_dir(
             &ControlMessage::BrowseDirectory {
                 destination_path: dest_root.to_string(),
                 relative_path: current_relative.clone(),
-                auth_code: auth_code.map(|s| s.to_string()),
+                auth_code: auth_code.clone(),
             },
         )
         .await?;
 
         let entries = match read_control_timeout(&mut stream, REPLY_TIMEOUT).await? {
             ControlMessage::DirectoryContents { entries, .. } => entries,
+            ControlMessage::Error { message } if message.contains("pairing code") => {
+                codes.remove(ip);
+                let Some(code) = ensure_code(screen, ip, auth_required, codes)? else {
+                    return Ok(None);
+                };
+                *auth_code = code;
+                continue;
+            }
             ControlMessage::Error { message } => bail!("{message}"),
             _ => bail!("unexpected response"),
         };
