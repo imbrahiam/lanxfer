@@ -22,6 +22,18 @@ Fast, resumable LAN file transfer CLI with zero-config peer mode. Built for movi
 cargo install --git https://github.com/imbrahiam/lanxfer
 ```
 
+### Updates
+
+Release binaries can update themselves from GitHub Releases:
+
+```bash
+lanxfer update --check
+lanxfer update
+```
+
+Use `lanxfer update --yes` for non-interactive installs. Builds installed
+through a package manager should continue using that package manager.
+
 ### Build locally
 
 ```bash

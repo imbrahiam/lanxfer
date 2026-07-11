@@ -2,10 +2,12 @@ mod cli;
 mod client;
 mod discovery;
 mod interactive;
+mod picker;
 mod protocol;
 mod server;
 mod storage;
 mod ui;
+mod updater;
 mod util;
 
 use anyhow::Result;
@@ -103,6 +105,9 @@ async fn run(cli: Cli) -> Result<()> {
                 !no_progress,
             )
             .await?;
+        }
+        Some(Command::Update { check, yes }) => {
+            updater::run(check, yes)?;
         }
     }
 

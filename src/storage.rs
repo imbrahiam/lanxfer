@@ -18,15 +18,15 @@ pub fn list_destinations() -> Vec<DestinationInfo> {
     ];
     let mut destinations = Vec::new();
     for (label, dir) in shortcuts {
-        if let Some(dir) = dir {
-            if dir.is_dir() {
-                destinations.push(DestinationInfo {
-                    label: label.to_string(),
-                    available_bytes: free_space_for(&disks, &dir),
-                    path: dir.to_string_lossy().to_string(),
-                    read_only: false,
-                });
-            }
+        if let Some(dir) = dir
+            && dir.is_dir()
+        {
+            destinations.push(DestinationInfo {
+                label: label.to_string(),
+                available_bytes: free_space_for(&disks, &dir),
+                path: dir.to_string_lossy().to_string(),
+                read_only: false,
+            });
         }
     }
 

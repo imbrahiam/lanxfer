@@ -63,10 +63,9 @@ pub async fn run_server(
         if let Err(err) =
             discovery::run_responder(discovery_port, local.port(), require_auth, discovery_device)
                 .await
+            && !quiet_errors
         {
-            if !quiet_errors {
-                eprintln!("discovery responder stopped: {err:#}");
-            }
+            eprintln!("discovery responder stopped: {err:#}");
         }
     });
 
@@ -78,10 +77,9 @@ pub async fn run_server(
         tokio::spawn(async move {
             if let Err(err) =
                 handle_client(socket, server_device, server_code, require_auth, sessions).await
+                && !quiet_errors
             {
-                if !quiet_errors {
-                    eprintln!("client {peer} error: {err:#}");
-                }
+                eprintln!("client {peer} error: {err:#}");
             }
         });
     }
