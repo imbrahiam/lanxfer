@@ -16,6 +16,12 @@ Fast, resumable LAN file transfer CLI with zero-config peer mode. Built for movi
 
 ## Install
 
+### Release binaries
+
+Download the archive for your platform from
+[GitHub Releases](https://github.com/imbrahiam/lanxfer/releases), extract
+`lanxfer`, and place it in a directory on `PATH`.
+
 ### From source (all platforms)
 
 ```bash
@@ -33,6 +39,10 @@ lanxfer update
 
 Use `lanxfer update --yes` for non-interactive installs. Builds installed
 through a package manager should continue using that package manager.
+
+Self-update replaces the running executable. It does not request elevation.
+If `lanxfer` lives in a protected system directory, run the update with the
+required permissions or reinstall it into a user-writable directory.
 
 ### Build locally
 
@@ -80,6 +90,24 @@ lanxfer --open        # peer mode, no code needed to receive
 lanxfer serve --open  # headless receiver, no code needed
 ```
 
+### Interactive controls
+
+The full-screen interface is optimized for keyboard use:
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move through options |
+| `j` / `k` | Move when the filter is empty |
+| Type | Filter the current list |
+| `Backspace` | Edit the filter |
+| `Enter` | Select or confirm |
+| `Esc` | Go back or quit |
+| `Home` / `End` | Jump to first or last option |
+
+The interface uses the terminal alternate screen, restores the cursor on
+exit, responds to terminal resizing, and falls back safely when output is not
+attached to an interactive terminal.
+
 ### Headless receiver
 
 If you want a machine to only receive (e.g., a server with no interactive shell):
@@ -113,6 +141,8 @@ lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3 --overwrite --jo
 | `lanxfer connect` | Connect to a receiver (discovery or `--target IP`) |
 | `lanxfer destinations <ip>` | List drives on a receiver |
 | `lanxfer send <ip> <src> <dest>` | Direct file transfer |
+| `lanxfer update --check` | Check GitHub Releases for a newer version |
+| `lanxfer update` | Download and install the latest release |
 
 ## Performance
 
@@ -170,6 +200,24 @@ sudo ufw allow 44819/udp
 New-NetFirewallRule -DisplayName "lanxfer TCP" -Direction Inbound -Protocol TCP -LocalPort 44818 -Action Allow
 New-NetFirewallRule -DisplayName "lanxfer UDP" -Direction Inbound -Protocol UDP -LocalPort 44819 -Action Allow
 ```
+
+### Permissions
+
+Normal transfers do not require `sudo` or Administrator rights. Elevation is
+only needed for protected source/destination paths, privileged ports below
+1024 on Unix, system-wide installation/update locations, or firewall rule
+creation. Running the receiver as an elevated user is discouraged.
+
+macOS folder/network privacy prompts and the Windows first-run firewall prompt
+are operating-system permissions; they do not require running every transfer
+as root or Administrator.
+
+## Releases
+
+Pushing a semantic version tag such as `v0.5.0` runs the release workflow. It
+builds archives for Windows x64, Linux x64, macOS Intel, and macOS Apple
+Silicon, then publishes them to GitHub Releases. Archive names match the
+platform identifiers used by `lanxfer update`.
 
 ## Architecture (protocol v3)
 
