@@ -79,7 +79,7 @@ Run `lanxfer` on every machine. That's it.
 lanxfer
 ```
 
-Each peer starts a background receiver, shows its own pairing code, and lists the other peers it discovers on the LAN. Pick a peer, enter its code (shown on its screen), browse, send. Done.
+Each peer starts a background receiver, shows its own pairing code, and lists the other peers it discovers on the LAN. Pick a peer, enter its code (shown on its screen), browse, then send files to it or pull files from it. Pulls authenticate the write-back with a one-time token — your pairing code never crosses the wire to the other machine.
 
 Once connected you stay in a session with that peer: send more files, reuse the last destination, view the list of transfers so far — no rescanning or re-entering the code between sends.
 
@@ -100,6 +100,7 @@ The full-screen interface is optimized for keyboard use:
 | `j` / `k` | Move when the filter is empty |
 | Type | Filter the current list |
 | `Backspace` | Edit the filter |
+| `Space` | Toggle selection in file pickers (multi-select) |
 | `Enter` | Select or confirm |
 | `Esc` | Go back or quit |
 | `Home` / `End` | Jump to first or last option |
@@ -211,6 +212,15 @@ creation. Running the receiver as an elevated user is discouraged.
 macOS folder/network privacy prompts and the Windows first-run firewall prompt
 are operating-system permissions; they do not require running every transfer
 as root or Administrator.
+
+## Debug logging
+
+The TUI owns the terminal, so logs go to a file instead of stdout:
+
+```bash
+LANXFER_LOG=debug lanxfer          # writes to /tmp/lanxfer.log
+LANXFER_LOG_FILE=~/lx.log lanxfer  # custom log path
+```
 
 ## Releases
 
