@@ -89,13 +89,14 @@ impl Progress {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let units = self
+        let mut units: Vec<_> = self
             .active
             .lock()
             .unwrap()
             .values()
             .map(|u| (u.label.clone(), u.done, u.total))
             .collect();
+        units.sort_by(|a, b| a.0.cmp(&b.0));
         Snapshot {
             total_bytes: self.total_bytes.load(Ordering::Relaxed),
             done_bytes: self.done_bytes.load(Ordering::Relaxed),
@@ -110,6 +111,8 @@ impl Progress {
 pub struct SpeedGauge {
     last: Option<(Instant, u64)>,
     ema: f64,
+    last_files: Option<(Instant, u64)>,
+    file_ema: f64,
 }
 
 impl Default for SpeedGauge {
@@ -117,6 +120,8 @@ impl Default for SpeedGauge {
         Self {
             last: None,
             ema: 0.0,
+            last_files: None,
+            file_ema: 0.0,
         }
     }
 }
@@ -142,13 +147,56 @@ impl SpeedGauge {
         }
         self.ema
     }
+
+    /// Smoothed completed-files/second. Combined with byte throughput for a
+    /// folder-wide ETA that accounts for per-file overhead on small files.
+    pub fn update_files(&mut self, done_files: u64) -> f64 {
+        let now = Instant::now();
+        if let Some((prev_t, prev_files)) = self.last_files {
+            let dt = now.duration_since(prev_t).as_secs_f64();
+            if dt >= 0.05 {
+                let inst = done_files.saturating_sub(prev_files) as f64 / dt;
+                if inst > 0.0 {
+                    self.file_ema = if self.file_ema == 0.0 {
+                        inst
+                    } else {
+                        0.3 * inst + 0.7 * self.file_ema
+                    };
+                }
+                self.last_files = Some((now, done_files));
+            }
+        } else {
+            self.last_files = Some((now, done_files));
+        }
+        self.file_ema
+    }
 }
 
-pub fn eta(remaining_bytes: u64, speed: f64) -> String {
-    if speed < 1.0 || remaining_bytes == 0 {
+/// Overall transfer ETA. Byte throughput models large files; file throughput
+/// models filesystem and protocol overhead for folders with many small files.
+/// Taking the slower estimate prevents the current active file from making a
+/// whole-folder transfer appear nearly finished.
+pub fn overall_eta(
+    remaining_bytes: u64,
+    bytes_per_second: f64,
+    remaining_files: u64,
+    files_per_second: f64,
+) -> String {
+    if remaining_bytes == 0 && remaining_files == 0 {
         return "—".to_string();
     }
-    let secs = (remaining_bytes as f64 / speed).round() as u64;
+    let byte_secs = (bytes_per_second >= 1.0).then(|| remaining_bytes as f64 / bytes_per_second);
+    let file_secs = (files_per_second > 0.0).then(|| remaining_files as f64 / files_per_second);
+    match (byte_secs, file_secs) {
+        (Some(bytes), Some(files)) => format_eta_seconds(bytes.max(files)),
+        (Some(bytes), None) => format_eta_seconds(bytes),
+        (None, Some(files)) => format_eta_seconds(files),
+        (None, None) => "—".to_string(),
+    }
+}
+
+fn format_eta_seconds(seconds: f64) -> String {
+    let secs = seconds.round() as u64;
     if secs >= 3600 {
         format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
     } else {
@@ -174,8 +222,10 @@ mod tests {
         // reset only when idle
         p.reset_if_idle();
         assert_eq!(p.snapshot().total_bytes, 0);
-        assert_eq!(eta(0, 100.0), "—");
-        assert_eq!(eta(500, 100.0), "0:05");
-        assert_eq!(eta(720_000, 100.0), "2:00:00");
+        assert_eq!(overall_eta(0, 100.0, 0, 0.0), "—");
+        assert_eq!(overall_eta(0, 0.0, 50, 5.0), "0:10");
+        assert_eq!(overall_eta(720_000, 100.0, 0, 0.0), "2:00:00");
+        assert_eq!(overall_eta(500, 100.0, 50, 5.0), "0:10");
+        assert_eq!(overall_eta(500, 100.0, 0, 0.0), "0:05");
     }
 }

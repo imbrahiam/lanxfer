@@ -452,14 +452,20 @@ fn recv_status_line(progress: &Progress, gauge: &mut SpeedGauge) -> Option<Strin
     }
     let s = progress.snapshot();
     let speed = gauge.update(s.done_bytes);
+    let file_rate = gauge.update_files(s.done_files);
     Some(format!(
-        "⇣ receiving {}/{} files · {} of {} · {}/s · ETA {}",
+        "⇣ receiving {}/{} files · {} of {} · {}/s · overall ETA {}",
         s.done_files,
         s.total_files,
         util::format_size(s.done_bytes),
         util::format_size(s.total_bytes),
         util::format_size(speed as u64),
-        crate::progress::eta(s.total_bytes.saturating_sub(s.done_bytes), speed),
+        crate::progress::overall_eta(
+            s.total_bytes.saturating_sub(s.done_bytes),
+            speed,
+            s.total_files.saturating_sub(s.done_files),
+            file_rate,
+        ),
     ))
 }
 
@@ -475,38 +481,52 @@ fn render_transfer_card(
 ) -> Result<()> {
     let s = progress.snapshot();
     let speed = gauge.update(s.done_bytes);
-    let pct = (s.done_bytes * 100).checked_div(s.total_bytes).unwrap_or(0);
-    let mut details = vec![
-        ("from".to_string(), source.to_string()),
-        ("to".to_string(), dest.to_string()),
-        (
-            "progress".to_string(),
-            format!(
-                "{}/{} files · {} of {} ({pct}%)",
-                s.done_files,
-                s.total_files,
-                util::format_size(s.done_bytes),
-                util::format_size(s.total_bytes),
-            ),
+    let file_rate = gauge.update_files(s.done_files);
+    let ratio = if s.total_bytes > 0 {
+        s.done_bytes as f64 / s.total_bytes as f64
+    } else if s.total_files > 0 {
+        s.done_files as f64 / s.total_files as f64
+    } else {
+        0.0
+    };
+    let pct = (ratio * 100.0).round() as u64;
+    let overall = format!(
+        "{pct}%  ·  {}/{} files  ·  {} / {}",
+        s.done_files,
+        s.total_files,
+        util::format_size(s.done_bytes),
+        util::format_size(s.total_bytes),
+    );
+    let rate = format!(
+        "Overall speed  {}/s    Overall folder ETA  {}",
+        util::format_size(speed as u64),
+        crate::progress::overall_eta(
+            s.total_bytes.saturating_sub(s.done_bytes),
+            speed,
+            s.total_files.saturating_sub(s.done_files),
+            file_rate,
         ),
-        (
-            "speed".to_string(),
+    );
+    let units: Vec<String> = s
+        .units
+        .iter()
+        .map(|(label, done, total)| {
+            let unit_pct = if *total > 0 { done * 100 / total } else { 0 };
             format!(
-                "{}/s · ETA {}",
-                util::format_size(speed as u64),
-                crate::progress::eta(s.total_bytes.saturating_sub(s.done_bytes), speed),
-            ),
-        ),
-    ];
-    for (label, done, total) in s.units.iter().take(8) {
-        let unit_pct = if *total > 0 { done * 100 / total } else { 0 };
-        details.push(("⇅".to_string(), format!("{label} · {unit_pct}%")));
-    }
-    screen.render(
+                "{label}  ·  {unit_pct:>3}%  ·  {} / {}",
+                util::format_size(*done),
+                util::format_size(*total)
+            )
+        })
+        .collect();
+    screen.render_transfer(
         title,
-        "Transferring…",
-        crate::picker::Tone::Info,
-        &details,
+        source,
+        dest,
+        &overall,
+        ratio,
+        &rate,
+        &units,
         "ctrl+c quits · transfers resume if interrupted",
     )
 }
@@ -1258,7 +1278,16 @@ async fn receive_flow(
         return Ok(());
     }
 
-    let source_label = format!("{}:{}", peer_label, remote_files[0].rel_path);
+    let source_label = if remote_files.len() == 1 {
+        format!("{} · {}", peer_label, remote_files[0].abs_path)
+    } else {
+        format!(
+            "{} · {} (+{} more)",
+            peer_label,
+            remote_files[0].abs_path,
+            remote_files.len() - 1
+        )
+    };
 
     // One-time token: our own server accepts the remote's write-back with
     // this instead of a pairing code the remote could never know.

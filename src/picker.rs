@@ -3,7 +3,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 use std::io::IsTerminal;
 
 // Keep the surface on the terminal's own background. Hard-coded RGB
@@ -192,6 +194,40 @@ impl StatusScreen {
     ) -> Result<()> {
         if let Some(terminal) = &mut self.terminal {
             terminal.draw(|frame| draw(frame, title, items, visible, selected, query, help))?;
+        }
+        Ok(())
+    }
+
+    /// Wide, terminal-filling transfer view. Kept separate from the compact
+    /// status/list cards so the initial peer picker retains its current size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_transfer(
+        &mut self,
+        title: &str,
+        source: &str,
+        destination: &str,
+        overall: &str,
+        ratio: f64,
+        rate: &str,
+        units: &[String],
+        footer: &str,
+    ) -> Result<()> {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.draw(|frame| {
+                draw_transfer(
+                    frame,
+                    title,
+                    source,
+                    destination,
+                    overall,
+                    ratio,
+                    rate,
+                    units,
+                    footer,
+                )
+            })?;
+        } else {
+            println!("{title}: {overall} · {rate}");
         }
         Ok(())
     }
@@ -425,6 +461,109 @@ fn draw_status(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_transfer(
+    frame: &mut ratatui::Frame,
+    title: &str,
+    source: &str,
+    destination: &str,
+    overall: &str,
+    ratio: f64,
+    rate: &str,
+    units: &[String],
+    footer: &str,
+) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let width = area.width.saturating_sub(4).clamp(1, 160);
+    let height = area.height.saturating_sub(2).clamp(1, 44);
+    let card = centered(area, width, height);
+    frame.render_widget(Clear, card);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED))
+            .style(Style::reset())
+            .padding(Padding::horizontal(2)),
+        card,
+    );
+    let inner = Rect::new(
+        card.x + 3,
+        card.y + 1,
+        card.width.saturating_sub(6),
+        card.height.saturating_sub(2),
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "⇄  LANXFER",
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   {title}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(source)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(" FROM ").borders(Borders::BOTTOM)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(destination)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(" TO ").borders(Borders::BOTTOM)),
+        rows[2],
+    );
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(overall),
+        rows[3],
+    );
+    frame.render_widget(
+        Paragraph::new(rate).style(Style::default().fg(VIOLET)),
+        rows[4],
+    );
+    let unit_items: Vec<ListItem> = if units.is_empty() {
+        vec![ListItem::new("  Preparing next file…").style(Style::default().fg(MUTED))]
+    } else {
+        units
+            .iter()
+            .map(|unit| ListItem::new(format!("  {unit}")))
+            .collect()
+    };
+    frame.render_widget(
+        List::new(unit_items).block(
+            Block::default()
+                .title(format!(" ACTIVE FILES ({}) ", units.len()))
+                .borders(Borders::TOP),
+        ),
+        rows[5],
+    );
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(MUTED)),
+        rows[6],
+    );
+}
+
 fn draw_input(
     frame: &mut ratatui::Frame,
     title: &str,
@@ -629,7 +768,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::filtered;
+    use super::{draw_transfer, filtered};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn filtering_is_case_insensitive_and_preserves_source_indices() {
@@ -637,5 +778,28 @@ mod tests {
         assert_eq!(filtered(&items, "desk"), vec![1]);
         assert_eq!(filtered(&items, "book"), vec![0]);
         assert_eq!(filtered(&items, ""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn transfer_view_handles_terminal_sizes() {
+        for (width, height) in [(20, 10), (82, 28), (180, 50)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_transfer(
+                        frame,
+                        "Sending",
+                        "/a/very/long/source/path",
+                        "/a/very/long/destination/path",
+                        "50% · 1/2 files · 5 MB / 10 MB",
+                        0.5,
+                        "Overall speed 5 MB/s · Overall folder ETA 0:01",
+                        &["folder/file.bin · 50% · 5 MB / 10 MB".into()],
+                        "ctrl+c quits",
+                    )
+                })
+                .unwrap();
+        }
     }
 }
