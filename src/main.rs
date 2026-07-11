@@ -16,10 +16,22 @@ use protocol::{DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let result = run(cli).await;
+    // dialoguer hides the cursor; restore it even when interrupted mid-prompt
+    let _ = console::Term::stdout().show_cursor();
+    result
+}
 
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         None => {
-            interactive::run_peer_mode(DEFAULT_DISCOVERY_PORT, 1500, DEFAULT_CONTROL_PORT).await?;
+            interactive::run_peer_mode(
+                DEFAULT_DISCOVERY_PORT,
+                1500,
+                DEFAULT_CONTROL_PORT,
+                cli.open,
+            )
+            .await?;
         }
         Some(Command::Interactive {
             discovery_port,
@@ -32,6 +44,7 @@ async fn main() -> Result<()> {
             bind,
             discovery_port,
             pairing_code,
+            open,
         }) => {
             let code = server::ensure_pairing_code(pairing_code);
             let device = util::local_device_info();
@@ -40,10 +53,15 @@ async fn main() -> Result<()> {
             ui::kv("host", &device.host_name);
             ui::kv("platform", &format!("{} {}", device.os, device.arch));
             ui::kv("listening", &format!("tcp {bind}  ·  udp {discovery_port}"));
-            ui::kv("pairing code", &ui::yellow(&code));
+            if open {
+                ui::kv("pairing code", &ui::dim("off (--open)"));
+                ui::warn("anyone on this network can send files to you");
+            } else {
+                ui::kv("pairing code", &ui::yellow(&code));
+            }
             println!();
             ui::info("waiting for senders…  (Ctrl-C to stop)");
-            server::run_server(bind, discovery_port, code, false).await?;
+            server::run_server(bind, discovery_port, code, false, !open).await?;
         }
         Some(Command::Discover {
             discovery_port,
