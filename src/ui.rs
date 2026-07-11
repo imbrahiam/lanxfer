@@ -10,14 +10,14 @@ pub fn banner() {
     println!(
         "  {}  {}  {}",
         style("◆").color256(81).bold(),
-        style("LANXFER").white().bold(),
+        style("LANXFER").bold(),
         style(format!(
             "v{}  /  fast, private, resumable",
             env!("CARGO_PKG_VERSION")
         ))
         .dim(),
     );
-    println!("  {}", style("━".repeat(54)).color256(238));
+    println!("  {}", style("━".repeat(54)).dim());
     println!();
 }
 
