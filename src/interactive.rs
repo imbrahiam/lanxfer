@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use inquire::{InquireError, Text};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +8,6 @@ use crate::protocol::{
     ControlMessage, DestinationInfo, PROTOCOL_VERSION, read_control, send_control,
 };
 use crate::server;
-use crate::ui;
 use crate::util;
 
 pub struct TransferRecord {
@@ -24,25 +22,32 @@ pub struct TransferRecord {
 
 /// Run a Select, return the chosen index; Esc returns None (go back).
 /// The answered line is cleared so looping menus don't accumulate residue.
-fn select(prompt: &str, items: Vec<String>, cursor: usize, help: &str) -> Result<Option<usize>> {
-    crate::picker::select(prompt, items, cursor, help)
+fn select(
+    screen: &mut crate::picker::StatusScreen,
+    prompt: &str,
+    items: Vec<String>,
+    cursor: usize,
+    help: &str,
+) -> Result<Option<usize>> {
+    screen.choose(prompt, items, cursor, help)
 }
 
-fn text(prompt: &str, help: &str) -> Result<Option<String>> {
-    match Text::new(prompt).with_help_message(help).prompt() {
-        Ok(v) => Ok(Some(v)),
-        Err(InquireError::OperationCanceled) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+fn text(
+    screen: &mut crate::picker::StatusScreen,
+    prompt: &str,
+    help: &str,
+    secret: bool,
+) -> Result<Option<String>> {
+    screen.input(prompt, prompt, help, secret)
 }
 
-fn confirm(prompt: &str, default: bool) -> Result<bool> {
+fn confirm(screen: &mut crate::picker::StatusScreen, prompt: &str, default: bool) -> Result<bool> {
     let items = if default {
         vec!["Yes".to_string(), "No".to_string()]
     } else {
         vec!["No".to_string(), "Yes".to_string()]
     };
-    let selection = crate::picker::select(prompt, items, 0, "↑↓ move · enter select · esc cancel")?;
+    let selection = screen.choose(prompt, items, 0, "↑↓ move · enter select · esc cancel")?;
     Ok(match selection {
         Some(index) => (default && index == 0) || (!default && index == 1),
         None => false,
@@ -57,7 +62,7 @@ pub async fn run_peer_mode(
     port: u16,
     open: bool,
 ) -> Result<()> {
-    ui::init_prompts();
+    let mut screen = crate::picker::StatusScreen::new()?;
 
     let device = util::local_device_info();
     let pairing_code = util::generate_pairing_code();
@@ -71,21 +76,38 @@ pub async fn run_peer_mode(
     let server_code = pairing_code.clone();
     tokio::spawn(async move {
         if let Err(err) = server::run_server(bind, discovery_port, server_code, true, !open).await {
-            ui::error(&format!("receiver crashed: {err:#}"));
+            let _ = err;
         }
     });
 
-    peer_loop(discovery_port, timeout_ms, port, true, &picker_title).await
+    peer_loop(
+        &mut screen,
+        discovery_port,
+        timeout_ms,
+        port,
+        true,
+        &picker_title,
+    )
+    .await
 }
 
 pub async fn run_interactive(discovery_port: u16, timeout_ms: u64, port: u16) -> Result<()> {
-    ui::init_prompts();
-    peer_loop(discovery_port, timeout_ms, port, false, "Pick a peer").await
+    let mut screen = crate::picker::StatusScreen::new()?;
+    peer_loop(
+        &mut screen,
+        discovery_port,
+        timeout_ms,
+        port,
+        false,
+        "Pick a peer",
+    )
+    .await
 }
 
 /// Discover peers, pick one, run a session. Repeats until the user quits.
 /// Pairing codes and transfer history persist across sessions.
 async fn peer_loop(
+    screen: &mut crate::picker::StatusScreen,
     discovery_port: u16,
     timeout_ms: u64,
     default_port: u16,
@@ -106,35 +128,60 @@ async fn peer_loop(
             if exclude_self {
                 hosts.retain(|h| !scan_ips.contains(&h.ip) && h.reply.host != scan_host);
             }
-            Ok(hosts)
+            Ok::<Vec<discovery::DiscoveredHost>, anyhow::Error>(hosts)
         };
-        let (hosts, selection) = crate::picker::select_after(
+        screen.render(
             picker_title,
-            "Scanning local network…",
-            0,
-            NAV_HELP,
-            scan,
-            |hosts| {
-                let mut items: Vec<String> = hosts
-                    .iter()
-                    .map(|h| {
-                        format!(
-                            "{:<20}  {}:{}  {} {}",
-                            h.reply.host,
-                            h.ip,
-                            h.reply.control_port,
-                            h.reply.device.os,
-                            h.reply.device.arch
-                        )
-                    })
-                    .collect();
-                items.push("Enter IP manually".to_string());
-                items.push("↻ Rescan".to_string());
-                items.push("✗ Quit".to_string());
-                items
-            },
-        )
-        .await?;
+            "Scanning for nearby peers…",
+            crate::picker::Tone::Info,
+            &[],
+            "Automatic discovery is active",
+        )?;
+        let hosts = scan.await?;
+        if hosts.is_empty() {
+            screen.render(
+                picker_title,
+                "No peers found yet",
+                crate::picker::Tone::Info,
+                &[],
+                "Rescanning automatically…  ·  esc quit",
+            )?;
+            if matches!(
+                screen.poll_key(std::time::Duration::from_millis(700))?,
+                Some(crossterm::event::KeyCode::Esc)
+            ) {
+                return Ok(());
+            }
+            continue;
+        }
+        let mut items: Vec<String> = hosts
+            .iter()
+            .map(|h| {
+                format!(
+                    "{:<20}  {}:{}  {} {}",
+                    h.reply.host,
+                    h.ip,
+                    h.reply.control_port,
+                    h.reply.device.os,
+                    h.reply.device.arch
+                )
+            })
+            .collect();
+        items.push("Enter IP manually".to_string());
+        items.push("↻ Rescan".to_string());
+        items.push("✗ Quit".to_string());
+        let selection = if hosts.len() == 1 {
+            screen.render(
+                picker_title,
+                &format!("Connecting to {}…", hosts[0].reply.host),
+                crate::picker::Tone::Info,
+                &[("address".into(), hosts[0].ip.clone())],
+                "Peer discovered automatically",
+            )?;
+            Some(0)
+        } else {
+            select(screen, picker_title, items, 0, NAV_HELP)?
+        };
         let Some(sel) = selection else {
             return Ok(()); // esc at top level = quit
         };
@@ -145,7 +192,7 @@ async fn peer_loop(
         } else if sel == items_len - 2 {
             continue;
         } else if sel == items_len - 3 {
-            let Some(ip) = text("Receiver IP", "esc to go back")? else {
+            let Some(ip) = text(screen, "Receiver IP", "esc to go back", false)? else {
                 continue;
             };
             let ip = ip.trim().to_string();
@@ -155,15 +202,28 @@ async fn peer_loop(
             (h.ip.clone(), h.reply.control_port, h.reply.host.clone())
         };
 
-        match peer_session(&ip, control_port, &label, &mut codes, &mut transfers).await {
+        match peer_session(
+            screen,
+            &ip,
+            control_port,
+            &label,
+            &mut codes,
+            &mut transfers,
+        )
+        .await
+        {
             Ok(true) => return Ok(()), // user chose quit
             Ok(false) => {}            // switch peer -> rescan
-            Err(err) => ui::modal(
-                "Connection",
-                &format!("{err:#}"),
-                crate::picker::Tone::Error,
-                vec![],
-            )?,
+            Err(err) => {
+                screen.render(
+                    "Connection",
+                    &format!("{err:#}"),
+                    crate::picker::Tone::Error,
+                    &[],
+                    "Rescanning automatically…",
+                )?;
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            }
         }
     }
 }
@@ -172,6 +232,7 @@ async fn peer_loop(
 /// no rediscovery, no re-entering the pairing code.
 /// Returns Ok(true) if the user wants to quit entirely.
 async fn peer_session(
+    screen: &mut crate::picker::StatusScreen,
     ip: &str,
     port: u16,
     label: &str,
@@ -205,6 +266,7 @@ async fn peer_session(
 
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
         let Some(sel) = select(
+            screen,
             &format!("{label} · what next?"),
             labels,
             0,
@@ -217,6 +279,7 @@ async fn peer_session(
         let result = match &menu[sel].1 {
             Action::Send => {
                 send_flow(
+                    screen,
                     ip,
                     port,
                     label,
@@ -231,6 +294,7 @@ async fn peer_session(
             Action::SendAgain => {
                 let dest = last_dest.clone();
                 send_flow(
+                    screen,
                     ip,
                     port,
                     label,
@@ -242,15 +306,22 @@ async fn peer_session(
                 )
                 .await
             }
-            Action::Drives => list_drives(ip, port).await,
-            Action::History => print_transfers(transfers),
+            Action::Drives => list_drives(screen, ip, port).await,
+            Action::History => print_transfers(screen, transfers),
             Action::SwitchPeer => return Ok(false),
             Action::Quit => return Ok(true),
         };
 
         if let Err(err) = result {
             let msg = format!("{err:#}");
-            ui::modal("Transfer", &msg, crate::picker::Tone::Error, vec![])?;
+            screen.render(
+                "Transfer",
+                &msg,
+                crate::picker::Tone::Error,
+                &[],
+                "enter / esc  continue",
+            )?;
+            screen.wait_for_close()?;
             if msg.contains("pairing code") {
                 // wrong/stale code — forget it so the next attempt re-prompts
                 codes.remove(ip);
@@ -286,6 +357,7 @@ async fn handshake_info(ip: &str, port: u16) -> Result<(crate::protocol::DeviceI
 }
 
 fn ensure_code(
+    screen: &mut crate::picker::StatusScreen,
     ip: &str,
     auth_required: bool,
     codes: &mut HashMap<String, String>,
@@ -296,7 +368,13 @@ fn ensure_code(
     if let Some(code) = codes.get(ip) {
         return Ok(Some(Some(code.clone())));
     }
-    let Some(code) = text("Pairing code", "shown on the other machine · esc cancels")? else {
+    let Some(code) = text(
+        screen,
+        "Pairing code",
+        "shown on the other machine · esc cancels",
+        true,
+    )?
+    else {
         return Ok(None);
     };
     let code = code.trim().to_uppercase();
@@ -316,9 +394,9 @@ fn local_ipv4s() -> Vec<String> {
     ips
 }
 
-async fn list_drives(ip: &str, port: u16) -> Result<()> {
+async fn list_drives(screen: &mut crate::picker::StatusScreen, ip: &str, port: u16) -> Result<()> {
     let items = fetch_destinations(ip, port).await?;
-    let details = items
+    let details: Vec<(String, String)> = items
         .iter()
         .map(|item| {
             let mode = if item.read_only {
@@ -336,12 +414,14 @@ async fn list_drives(ip: &str, port: u16) -> Result<()> {
             )
         })
         .collect();
-    ui::modal(
+    screen.render(
         "Remote drives",
         &format!("{} destination(s)", items.len()),
         crate::picker::Tone::Info,
-        details,
-    )
+        &details,
+        "enter / esc  close",
+    )?;
+    screen.wait_for_close()
 }
 
 async fn fetch_destinations(ip: &str, port: u16) -> Result<Vec<DestinationInfo>> {
@@ -357,6 +437,7 @@ async fn fetch_destinations(ip: &str, port: u16) -> Result<Vec<DestinationInfo>>
 
 #[allow(clippy::too_many_arguments)]
 async fn send_flow(
+    screen: &mut crate::picker::StatusScreen,
     ip: &str,
     port: u16,
     peer_label: &str,
@@ -366,7 +447,7 @@ async fn send_flow(
     last_dest: &mut Option<String>,
     reuse_dest: Option<String>,
 ) -> Result<()> {
-    let Some(auth_code) = ensure_code(ip, auth_required, codes)? else {
+    let Some(auth_code) = ensure_code(screen, ip, auth_required, codes)? else {
         return Ok(());
     };
     let auth = auth_code.as_deref();
@@ -393,23 +474,24 @@ async fn send_flow(
                 })
                 .collect();
 
-            let Some(drive_idx) = select("Destination drive", drive_items, 0, NAV_HELP)? else {
+            let Some(drive_idx) = select(screen, "Destination drive", drive_items, 0, NAV_HELP)?
+            else {
                 return Ok(());
             };
 
-            match browse_remote_dir(ip, port, &writable[drive_idx].path, auth).await? {
+            match browse_remote_dir(screen, ip, port, &writable[drive_idx].path, auth).await? {
                 Some(path) => path,
                 None => return Ok(()),
             }
         }
     };
 
-    let local_paths = match pick_local_paths()? {
+    let local_paths = match pick_local_paths(screen)? {
         Some(paths) if !paths.is_empty() => paths,
         _ => return Ok(()),
     };
 
-    if !confirm("Start transfer?", true)? {
+    if !confirm(screen, "Start transfer?", true)? {
         return Ok(());
     }
 
@@ -422,6 +504,16 @@ async fn send_flow(
             local_paths.len() - 1
         )
     };
+    screen.render(
+        "Transfer",
+        "Sending files…",
+        crate::picker::Tone::Info,
+        &[
+            ("destination".into(), remote_path.clone()),
+            ("source".into(), source_label.clone()),
+        ],
+        "Transfer is active · resumable if interrupted",
+    )?;
     let result = client::send_session(
         ip,
         port,
@@ -432,7 +524,7 @@ async fn send_flow(
             overwrite: false,
             dry_run: false,
             jobs: None,
-            show_progress: true,
+            show_progress: false,
         },
     )
     .await;
@@ -477,16 +569,21 @@ async fn send_flow(
         }
         bail!("some transfers failed — send again to retry (transfers resume)");
     }
-    ui::modal(
+    screen.render(
         "Transfer",
         "All transfers complete",
         crate::picker::Tone::Success,
-        details,
-    )
+        &details,
+        "enter / esc  continue",
+    )?;
+    screen.wait_for_close()
 }
 
-fn print_transfers(transfers: &[TransferRecord]) -> Result<()> {
-    let details = transfers
+fn print_transfers(
+    screen: &mut crate::picker::StatusScreen,
+    transfers: &[TransferRecord],
+) -> Result<()> {
+    let details: Vec<(String, String)> = transfers
         .iter()
         .enumerate()
         .map(|(index, t)| {
@@ -510,7 +607,7 @@ fn print_transfers(transfers: &[TransferRecord]) -> Result<()> {
             )
         })
         .collect();
-    ui::modal(
+    screen.render(
         "Session history",
         if transfers.is_empty() {
             "No transfers yet"
@@ -518,12 +615,15 @@ fn print_transfers(transfers: &[TransferRecord]) -> Result<()> {
             "Transfers this session"
         },
         crate::picker::Tone::Info,
-        details,
-    )
+        &details,
+        "enter / esc  close",
+    )?;
+    screen.wait_for_close()
 }
 
 /// Returns Ok(None) when the user backs out with Esc.
 async fn browse_remote_dir(
+    screen: &mut crate::picker::StatusScreen,
     ip: &str,
     port: u16,
     dest_root: &str,
@@ -567,6 +667,7 @@ async fn browse_remote_dir(
         }
 
         let Some(selection) = select(
+            screen,
             &format!("remote · {display_path}"),
             items.clone(),
             last_idx.min(items.len() - 1),
@@ -641,7 +742,7 @@ enum StartChoice {
     Manual,
 }
 
-fn pick_start_dir() -> Result<Option<PathBuf>> {
+fn pick_start_dir(screen: &mut crate::picker::StatusScreen) -> Result<Option<PathBuf>> {
     let cwd = std::env::current_dir()?;
     let home = dirs::home_dir().unwrap_or_else(|| cwd.clone());
 
@@ -679,16 +780,15 @@ fn pick_start_dir() -> Result<Option<PathBuf>> {
     options.push(("Enter path manually".to_string(), StartChoice::Manual));
 
     let labels: Vec<String> = options.iter().map(|(s, _)| s.clone()).collect();
-    let Some(idx) = select("Browse from", labels, 0, NAV_HELP)? else {
+    let Some(idx) = select(screen, "Browse from", labels, 0, NAV_HELP)? else {
         return Ok(None);
     };
 
     Ok(match &options[idx].1 {
         StartChoice::Path(p) => Some(p.clone()),
-        StartChoice::Drives => pick_windows_drive()?,
-        StartChoice::Manual => {
-            text("Enter path", "esc to go back")?.map(|path| PathBuf::from(path.trim()))
-        }
+        StartChoice::Drives => pick_windows_drive(screen)?,
+        StartChoice::Manual => text(screen, "Enter path", "esc to go back", false)?
+            .map(|path| PathBuf::from(path.trim())),
     })
 }
 
@@ -699,8 +799,8 @@ fn pick_start_dir() -> Result<Option<PathBuf>> {
 /// - "Done" confirms; Esc goes up / backs out
 ///
 /// Returns Ok(None) when the user backs out.
-fn pick_local_paths() -> Result<Option<Vec<PathBuf>>> {
-    let Some(mut current_dir) = pick_start_dir()? else {
+fn pick_local_paths(screen: &mut crate::picker::StatusScreen) -> Result<Option<Vec<PathBuf>>> {
+    let Some(mut current_dir) = pick_start_dir(screen)? else {
         return Ok(None);
     };
     let mut selected: Vec<PathBuf> = Vec::new();
@@ -711,7 +811,13 @@ fn pick_local_paths() -> Result<Option<Vec<PathBuf>>> {
         let dir_iter = match std::fs::read_dir(&current_dir) {
             Ok(it) => it,
             Err(err) => {
-                ui::error(&format!("cannot read {}: {err}", current_dir.display()));
+                screen.render(
+                    "Local files",
+                    &format!("cannot read {}: {err}", current_dir.display()),
+                    crate::picker::Tone::Error,
+                    &[],
+                    "Returning to the parent folder…",
+                )?;
                 match current_dir.parent() {
                     Some(parent) => {
                         current_dir = parent.to_path_buf();
@@ -772,6 +878,7 @@ fn pick_local_paths() -> Result<Option<Vec<PathBuf>>> {
             selected.len()
         );
         let Some(idx) = select(
+            screen,
             &prompt,
             items.clone(),
             last_idx.min(items.len() - 1),
@@ -793,7 +900,7 @@ fn pick_local_paths() -> Result<Option<Vec<PathBuf>>> {
         match idx {
             0 => {
                 if selected.is_empty() {
-                    if confirm("Nothing selected. Cancel?", true)? {
+                    if confirm(screen, "Nothing selected. Cancel?", true)? {
                         return Ok(None);
                     }
                 } else {
@@ -804,7 +911,7 @@ fn pick_local_paths() -> Result<Option<Vec<PathBuf>>> {
                 if let Some(parent) = current_dir.parent() {
                     current_dir = parent.to_path_buf();
                 } else if cfg!(windows) {
-                    match pick_windows_drive()? {
+                    match pick_windows_drive(screen)? {
                         Some(d) => current_dir = d,
                         None => return Ok(None),
                     }
@@ -833,7 +940,7 @@ fn toggle(selected: &mut Vec<PathBuf>, path: &Path) {
     }
 }
 
-fn pick_windows_drive() -> Result<Option<PathBuf>> {
+fn pick_windows_drive(screen: &mut crate::picker::StatusScreen) -> Result<Option<PathBuf>> {
     let mut drives: Vec<PathBuf> = Vec::new();
     for letter in b'A'..=b'Z' {
         let p = PathBuf::from(format!("{}:\\", letter as char));
@@ -845,7 +952,7 @@ fn pick_windows_drive() -> Result<Option<PathBuf>> {
         bail!("no drives detected");
     }
     let labels: Vec<String> = drives.iter().map(|d| d.display().to_string()).collect();
-    Ok(select("Select drive", labels, 0, NAV_HELP)?.map(|idx| drives[idx].clone()))
+    Ok(select(screen, "Select drive", labels, 0, NAV_HELP)?.map(|idx| drives[idx].clone()))
 }
 
 #[cfg(test)]

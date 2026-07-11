@@ -65,7 +65,7 @@ pub async fn run_server(
                 .await
             && !quiet_errors
         {
-            eprintln!("discovery responder stopped: {err:#}");
+            let _ = err;
         }
     });
 
@@ -79,7 +79,7 @@ pub async fn run_server(
                 handle_client(socket, server_device, server_code, require_auth, sessions).await
                 && !quiet_errors
             {
-                eprintln!("client {peer} error: {err:#}");
+                let _ = (peer, err);
             }
         });
     }
