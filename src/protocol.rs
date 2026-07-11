@@ -2,10 +2,11 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_CONTROL_PORT: u16 = 44818;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 44819;
-const MAX_CONTROL_FRAME: usize = 4 * 1024 * 1024;
+// Manifests carry the whole file tree in one frame.
+const MAX_CONTROL_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -32,11 +33,37 @@ pub struct DirEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrepareStatus {
-    Ready,
-    AlreadyExists,
+pub struct FileSpec {
+    pub id: u32,
+    pub rel_path: String,
+    pub size: u64,
+    pub mtime_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirSpec {
+    pub rel_path: String,
+    pub mtime_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanAction {
+    /// Send the whole file from byte 0.
+    Send,
+    /// A matching `.part` file exists — continue from `offset` if the
+    /// sender's prefix hash matches `partial_hash`.
+    Resume { offset: u64, partial_hash: String },
+    /// Identical size + mtime already at destination.
+    SkipUpToDate,
+    /// Exists with different content and overwrite is off.
     Conflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAction {
+    pub id: u32,
+    pub action: PlanAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,57 +82,6 @@ pub enum ControlMessage {
     Destinations {
         items: Vec<DestinationInfo>,
     },
-    CreateDirectory {
-        destination_path: String,
-        relative_path: String,
-        mtime_secs: i64,
-        auth_code: Option<String>,
-        dry_run: bool,
-    },
-    DirectoryCreated {
-        relative_path: String,
-    },
-    PrepareUpload {
-        destination_path: String,
-        relative_path: String,
-        file_size: u64,
-        file_hash: String,
-        mtime_secs: i64,
-        overwrite: bool,
-        auth_code: Option<String>,
-        dry_run: bool,
-    },
-    UploadReady {
-        status: PrepareStatus,
-        offset: u64,
-        partial_hash: Option<String>,
-        message: Option<String>,
-    },
-    RestartUpload {
-        destination_path: String,
-        relative_path: String,
-        auth_code: Option<String>,
-    },
-    BeginUpload {
-        destination_path: String,
-        relative_path: String,
-        offset: u64,
-        file_size: u64,
-        file_hash: String,
-        mtime_secs: i64,
-        overwrite: bool,
-        auth_code: Option<String>,
-        dry_run: bool,
-    },
-    BeginAck {
-        offset: u64,
-    },
-    TransferResult {
-        verified: bool,
-        final_hash: String,
-        bytes_received: u64,
-        error: Option<String>,
-    },
     BrowseDirectory {
         destination_path: String,
         relative_path: String,
@@ -115,6 +91,51 @@ pub enum ControlMessage {
         relative_path: String,
         entries: Vec<DirEntry>,
     },
+
+    // --- v3 session protocol ---
+    /// Whole transfer manifest in one message. Receiver creates directories,
+    /// plans each file, and replies with SessionPlan.
+    BeginSession {
+        destination_path: String,
+        auth_code: Option<String>,
+        overwrite: bool,
+        dry_run: bool,
+        files: Vec<FileSpec>,
+        dirs: Vec<DirSpec>,
+    },
+    SessionPlan {
+        session_id: String,
+        actions: Vec<FileAction>,
+    },
+    /// Sender's local prefix didn't match a Resume action — receiver must
+    /// truncate the part file and expect the whole file from 0.
+    RestartFile {
+        id: u32,
+    },
+    RestartAck {
+        id: u32,
+    },
+    /// Sent on a data connection to bind it to a session.
+    JoinSession {
+        session_id: String,
+    },
+    JoinAck,
+    /// Data frame header: exactly `len` raw bytes follow on this connection,
+    /// then the next control frame — back-to-back, no acks in between.
+    SendFile {
+        id: u32,
+        offset: u64,
+        len: u64,
+    },
+    /// Emitted on the control connection when a file is fully received,
+    /// verified-by-hash and renamed into place.
+    FileDone {
+        id: u32,
+        hash: String,
+        ok: bool,
+        error: Option<String>,
+    },
+
     Error {
         message: String,
     },
