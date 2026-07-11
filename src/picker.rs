@@ -6,10 +6,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
 use std::io::IsTerminal;
 
-const CYAN: Color = Color::Rgb(73, 214, 255);
-const VIOLET: Color = Color::Rgb(168, 139, 250);
-const MUTED: Color = Color::Rgb(113, 113, 122);
-const PANEL: Color = Color::Rgb(24, 24, 27);
+// Keep the surface on the terminal's own background. Hard-coded RGB
+// backgrounds render inconsistently in terminals without true-color support
+// (and make light themes unreadable). Named accents are broadly supported.
+const CYAN: Color = Color::Cyan;
+const VIOLET: Color = Color::Magenta;
+const MUTED: Color = Color::DarkGray;
 
 pub fn select(title: &str, items: Vec<String>, start: usize, help: &str) -> Result<Option<usize>> {
     if !std::io::stdout().is_terminal() {
@@ -88,10 +90,7 @@ fn draw(
     help: &str,
 ) {
     let area = frame.area();
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(9, 9, 11))),
-        area,
-    );
+    frame.render_widget(Block::default().style(Style::reset()), area);
     let width = area.width.min(82);
     let height = area.height.clamp(12, 28);
     let card = centered(area, width, height);
@@ -99,8 +98,8 @@ fn draw(
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(63, 63, 70)))
-            .style(Style::default().bg(PANEL))
+            .border_style(Style::default().fg(MUTED))
+            .style(Style::reset())
             .padding(Padding::horizontal(2)),
         card,
     );
@@ -129,7 +128,7 @@ fn draw(
             Span::styled(
                 format!("   {title}"),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(Color::Reset)
                     .add_modifier(Modifier::BOLD),
             ),
         ])),
@@ -149,14 +148,14 @@ fn draw(
                 Style::default().fg(if query.is_empty() {
                     MUTED
                 } else {
-                    Color::White
+                    Color::Reset
                 }),
             ),
         ]))
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::Rgb(39, 39, 42))),
+                .border_style(Style::default().fg(MUTED)),
         ),
         rows[1],
     );
@@ -171,12 +170,7 @@ fn draw(
     };
     let list = List::new(list_items)
         .highlight_symbol("  ❯ ")
-        .highlight_style(
-            Style::default()
-                .fg(CYAN)
-                .bg(Color::Rgb(39, 39, 42))
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
     let mut state = ListState::default().with_selected((!visible.is_empty()).then_some(selected));
     frame.render_stateful_widget(list, rows[2], &mut state);
 
