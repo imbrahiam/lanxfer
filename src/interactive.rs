@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::client;
 use crate::discovery;
@@ -140,29 +140,42 @@ async fn peer_loop(
         // Custom picker loop with background rescan.
         let mut query = String::new();
         let mut selected = 0usize;
-        let mut last_refresh = Instant::now();
-        let refresh_interval = Duration::from_millis(700);
+        let mut scan_task: Option<tokio::task::JoinHandle<Vec<discovery::DiscoveredHost>>> = None;
 
         let picked: Option<(usize, usize)> = loop {
             let visible = filtered(&items, &query);
             selected = selected.min(visible.len().saturating_sub(1));
             screen.draw_list(picker_title, &items, &visible, selected, &query, NAV_HELP)?;
 
-            // Wait for input or timeout for refresh.
-            let remaining = refresh_interval
-                .checked_sub(last_refresh.elapsed())
-                .unwrap_or(Duration::ZERO);
-            let timed_out = !event::poll(remaining)?;
+            // Check if a background scan finished — never blocks on it.
+            if let Some(task) = scan_task.take() {
+                if task.is_finished() {
+                    if let Ok(new_hosts) = task.await {
+                        hosts = new_hosts;
+                        items = hosts_to_items(&hosts);
+                        items.push("Enter IP manually".to_string());
+                        items.push("\u{21bb} Rescan".to_string());
+                        items.push("\u{2717} Quit".to_string());
+                        selected = selected.min(items.len().saturating_sub(1));
+                    }
+                } else {
+                    // Not done yet — put it back and continue processing input.
+                    scan_task = Some(task);
+                }
+            }
 
-            if timed_out {
-                // Background rescan — update items silently.
-                hosts = scan_hosts(discovery_port, timeout_ms, exclude_self, &local_ips, &my_host).await;
-                items = hosts_to_items(&hosts);
-                items.push("Enter IP manually".to_string());
-                items.push("\u{21bb} Rescan".to_string());
-                items.push("\u{2717} Quit".to_string());
-                selected = selected.min(items.len().saturating_sub(1));
-                last_refresh = Instant::now();
+            // Start a new scan if none is running.
+            if scan_task.is_none() {
+                let ips = local_ips.clone();
+                let host = my_host.clone();
+                scan_task = Some(tokio::spawn(async move {
+                    scan_hosts(discovery_port, timeout_ms, exclude_self, &ips, &host).await
+                }));
+            }
+
+            // Non-blocking poll: only blocks the terminal event queue,
+            // never the async runtime.
+            if !event::poll(Duration::from_millis(50))? {
                 continue;
             }
 
