@@ -86,7 +86,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &details,
                 "Ctrl-C  stop",
             )?;
-            server::run_server(bind, discovery_port, code, false, !open).await?;
+            server::run_server(bind, discovery_port, code, false, !open, None).await?;
         }
         Some(Command::Discover {
             discovery_port,

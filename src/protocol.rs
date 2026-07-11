@@ -81,6 +81,10 @@ pub enum ControlMessage {
     Hello {
         version: u32,
         client_name: String,
+        /// Client's listening port for reverse-initiated sessions.
+        /// Missing in older clients — defaults to 0.
+        #[serde(default)]
+        client_port: u16,
     },
     HelloAck {
         version: u32,

@@ -853,6 +853,7 @@ pub(crate) async fn connect_and_handshake(
         &ControlMessage::Hello {
             version: PROTOCOL_VERSION,
             client_name: util::host_name(),
+            client_port: port,
         },
     )
     .await?;

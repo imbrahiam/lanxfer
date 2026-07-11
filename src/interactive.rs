@@ -3,6 +3,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 use crate::client;
 use crate::discovery;
@@ -21,6 +23,28 @@ pub struct TransferRecord {
     pub skipped: usize,
     pub bytes: u64,
     pub ok: bool,
+}
+
+/// Events sent from the server task to the interactive UI.
+pub enum ServerEvent {
+    /// A new client connected — stream, client name, client port, client IP.
+    PeerConnected(TcpStream, String, u16, String),
+    /// Progress update: file (id, bytes received, total bytes).
+    TransferProgress {
+        file_id: u32,
+        file_name: String,
+        received: u64,
+        total: u64,
+    },
+    /// A file finished receiving (success or error).
+    FileDone {
+        file_id: u32,
+        file_name: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    /// Client disconnected.
+    Disconnected,
 }
 
 /// Run a Select, return the chosen index; Esc returns None (go back).
@@ -75,10 +99,14 @@ pub async fn run_peer_mode(
         format!("{}  ·  code {pairing_code}", device.host_name)
     };
 
+    let (server_tx, server_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let bind = format!("0.0.0.0:{port}");
     let server_code = pairing_code.clone();
     tokio::spawn(async move {
-        if let Err(err) = server::run_server(bind, discovery_port, server_code, true, !open).await {
+        if let Err(err) =
+            server::run_server(bind, discovery_port, server_code, true, !open, Some(server_tx))
+                .await
+        {
             let _ = err;
         }
     });
@@ -90,6 +118,7 @@ pub async fn run_peer_mode(
         port,
         true,
         &picker_title,
+        Some(server_rx),
     )
     .await
 }
@@ -103,6 +132,7 @@ pub async fn run_interactive(discovery_port: u16, timeout_ms: u64, port: u16) ->
         port,
         false,
         "Pick a peer",
+        None,
     )
     .await
 }
@@ -116,6 +146,7 @@ async fn peer_loop(
     default_port: u16,
     exclude_self: bool,
     picker_title: &str,
+    mut server_rx: Option<mpsc::UnboundedReceiver<ServerEvent>>,
 ) -> Result<()> {
     let mut codes: HashMap<String, String> = HashMap::new();
     let mut transfers: Vec<TransferRecord> = Vec::new();
@@ -142,7 +173,12 @@ async fn peer_loop(
         let mut selected = 0usize;
         let mut scan_task: Option<tokio::task::JoinHandle<Vec<discovery::DiscoveredHost>>> = None;
 
-        let picked: Option<(usize, usize)> = loop {
+        enum PickerResult {
+            Selected(usize, usize),
+            PeerConnected(TcpStream, String, u16, String),
+        }
+
+        let result: PickerResult = 'picker: loop {
             let visible = filtered(&items, &query);
             selected = selected.min(visible.len().saturating_sub(1));
             screen.draw_list(picker_title, &items, &visible, selected, &query, NAV_HELP)?;
@@ -159,7 +195,6 @@ async fn peer_loop(
                         selected = selected.min(items.len().saturating_sub(1));
                     }
                 } else {
-                    // Not done yet — put it back and continue processing input.
                     scan_task = Some(task);
                 }
             }
@@ -171,6 +206,15 @@ async fn peer_loop(
                 scan_task = Some(tokio::spawn(async move {
                     scan_hosts(discovery_port, timeout_ms, exclude_self, &ips, &host).await
                 }));
+            }
+
+            // Check for incoming server events (peer connected).
+            if let Some(rx) = &mut server_rx {
+                while let Ok(evt) = rx.try_recv() {
+                    if let ServerEvent::PeerConnected(stream, name, port, ip) = evt {
+                        break 'picker PickerResult::PeerConnected(stream, name, port, ip);
+                    }
+                }
             }
 
             // Non-blocking poll: only blocks the terminal event queue,
@@ -186,9 +230,9 @@ async fn peer_loop(
                 continue;
             }
             match key.code {
-                KeyCode::Esc => break None,
+                KeyCode::Esc => return Ok(()),
                 KeyCode::Enter if !visible.is_empty() => {
-                    break Some((visible[selected], items.len()));
+                    break PickerResult::Selected(visible[selected], items.len());
                 }
                 KeyCode::Up | KeyCode::Char('k') if query.is_empty() => {
                     selected = selected.saturating_sub(1);
@@ -214,8 +258,23 @@ async fn peer_loop(
             }
         };
 
-        let Some((sel, items_len)) = picked else {
-            return Ok(()); // esc at top level = quit
+        // A peer connected while we were in the picker — show connected state.
+        if let PickerResult::PeerConnected(stream, client_name, client_port, client_ip) = result {
+            server::connected_peer_ui(
+                screen,
+                stream,
+                &client_name,
+                &client_ip,
+                client_port,
+                default_port,
+                &mut transfers,
+            )
+            .await?;
+            continue;
+        }
+
+        let PickerResult::Selected(sel, items_len) = result else {
+            unreachable!();
         };
 
         let (ip, control_port, label) = if sel == items_len - 1 {
@@ -459,6 +518,7 @@ async fn handshake_info(ip: &str, port: u16) -> Result<(crate::protocol::DeviceI
         &ControlMessage::Hello {
             version: PROTOCOL_VERSION,
             client_name: util::host_name(),
+            client_port: port,
         },
     )
     .await?;
