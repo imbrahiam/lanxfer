@@ -158,6 +158,10 @@ pub enum ControlMessage {
         requester_port: u16,
         auth_code: Option<String>,
         overwrite: bool,
+        /// One-time token the requester registered with its own server —
+        /// authorizes the remote's write-back without leaking pairing codes.
+        #[serde(default)]
+        return_auth_code: Option<String>,
     },
     /// Sent by the remote after finishing a PushRequest transfer.
     PushComplete {

@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow, bail};
-use std::collections::HashMap;
+use log::{debug, info, warn};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::fs::{self, OpenOptions};
@@ -23,12 +24,26 @@ pub fn ensure_pairing_code(opt: Option<String>) -> String {
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
+/// One-time tokens registered by our own pull requests: when we ask a peer
+/// to push files back to us, the write-back BeginSession authenticates with
+/// this token instead of our pairing code (which the peer must never learn).
+pub type PullTokens = Arc<Mutex<HashSet<String>>>;
+
+fn consume_pull_token(tokens: &PullTokens, code: Option<&str>) -> bool {
+    match code {
+        Some(code) => tokens.lock().unwrap().remove(code),
+        None => false,
+    }
+}
+
 struct Session {
     dest_root: String,
     overwrite: bool,
     files: Mutex<HashMap<u32, FileState>>,
     /// FileDone / RestartAck messages routed to the control connection.
     out_tx: mpsc::UnboundedSender<ControlMessage>,
+    /// Live counters shown by the receiving side's UI.
+    progress: Arc<crate::progress::Progress>,
 }
 
 struct FileState {
@@ -50,6 +65,7 @@ struct FileState {
 /// Serve control connections on an already-bound listener. Binding happens
 /// at the call site so a busy port fails fast and visibly, not inside a
 /// background task.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     listener: TcpListener,
     discovery_port: u16,
@@ -57,10 +73,13 @@ pub async fn run_server(
     quiet_errors: bool,
     require_auth: bool,
     ui_tx: Option<mpsc::UnboundedSender<super::interactive::ServerEvent>>,
+    pull_tokens: PullTokens,
+    recv_progress: Arc<crate::progress::Progress>,
 ) -> Result<()> {
     let local = listener.local_addr()?;
     let device = util::local_device_info();
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    info!("server listening on {local} (auth: {require_auth})");
 
     let discovery_device = device.clone();
     tokio::spawn(async move {
@@ -75,10 +94,13 @@ pub async fn run_server(
 
     loop {
         let (socket, peer) = listener.accept().await?;
+        debug!("accepted connection from {peer}");
         let server_device = device.clone();
         let server_code = pairing_code.clone();
         let sessions = Arc::clone(&sessions);
         let ui_tx = ui_tx.clone();
+        let pull_tokens = Arc::clone(&pull_tokens);
+        let recv_progress = Arc::clone(&recv_progress);
         tokio::spawn(async move {
             if let Err(err) = handle_client(
                 socket,
@@ -87,11 +109,13 @@ pub async fn run_server(
                 require_auth,
                 sessions,
                 ui_tx,
+                pull_tokens,
+                recv_progress,
             )
             .await
-                && !quiet_errors
             {
-                let _ = (peer, err);
+                warn!("connection from {peer} ended with error: {err:#}");
+                let _ = quiet_errors;
             }
         });
     }
@@ -103,6 +127,7 @@ fn tune_socket(stream: &TcpStream) {
     let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut stream: TcpStream,
     server_device: crate::protocol::DeviceInfo,
@@ -110,6 +135,8 @@ async fn handle_client(
     require_auth: bool,
     sessions: Sessions,
     ui_tx: Option<mpsc::UnboundedSender<super::interactive::ServerEvent>>,
+    pull_tokens: PullTokens,
+    recv_progress: Arc<crate::progress::Progress>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     tune_socket(&stream);
@@ -208,7 +235,17 @@ async fn handle_client(
                 files,
                 dirs,
             } => {
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code, require_auth) {
+                info!(
+                    "BeginSession from {client_name}: {} files, {} dirs -> {destination_path}",
+                    files.len(),
+                    dirs.len()
+                );
+                // A pull we initiated authenticates with its one-time token
+                // instead of our pairing code.
+                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code, require_auth)
+                    && !consume_pull_token(&pull_tokens, auth_code.as_deref())
+                {
+                    warn!("BeginSession rejected: {err}");
                     send_control(
                         &mut stream,
                         &ControlMessage::Error {
@@ -242,6 +279,7 @@ async fn handle_client(
                     overwrite,
                     files,
                     dirs,
+                    recv_progress,
                 )
                 .await;
             }
@@ -251,8 +289,14 @@ async fn handle_client(
                 requester_port,
                 auth_code,
                 overwrite,
+                return_auth_code,
             } => {
+                info!(
+                    "PushRequest from {client_name}: {} files -> {dest_local_path} (reply port {requester_port})",
+                    files.len()
+                );
                 if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code, require_auth) {
+                    warn!("PushRequest rejected: {err}");
                     send_control(
                         &mut stream,
                         &ControlMessage::Error {
@@ -276,20 +320,20 @@ async fn handle_client(
                     }
                 };
                 send_control(&mut stream, &ControlMessage::JoinAck).await?;
-                let code = pairing_code.clone();
                 tokio::spawn(async move {
-                    let _ = handle_push_request(
+                    if let Err(err) = handle_push_request(
                         stream,
                         &requester_ip,
                         requester_port,
                         &files,
                         &dest_local_path,
-                        auth_code.as_deref(),
+                        return_auth_code.as_deref(),
                         overwrite,
-                        code,
-                        require_auth,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!("push request failed: {err:#}");
+                    }
                 });
                 return Ok(());
             }
@@ -363,6 +407,7 @@ async fn run_session_control(
     overwrite: bool,
     files: Vec<FileSpec>,
     dirs: Vec<DirSpec>,
+    recv_progress: Arc<crate::progress::Progress>,
 ) -> Result<()> {
     let (actions, states) =
         match plan_session(&destination_path, overwrite, &files, &dirs, false).await {
@@ -380,6 +425,17 @@ async fn run_session_control(
             }
         };
 
+    // Live receive counters: only files that will actually stream.
+    let (plan_bytes, plan_files) = states
+        .values()
+        .filter(|s| s.expects_data)
+        .fold((0u64, 0u64), |(b, n), s| {
+            (b + (s.size - s.start_offset), n + 1)
+        });
+    recv_progress.reset_if_idle();
+    recv_progress.add_totals(plan_bytes, plan_files);
+    info!("session planned: {plan_files} files, {plan_bytes} bytes to receive");
+
     let session_id = uuid::Uuid::new_v4().simple().to_string();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ControlMessage>();
     let session = Arc::new(Session {
@@ -387,6 +443,7 @@ async fn run_session_control(
         overwrite,
         files: Mutex::new(states),
         out_tx,
+        progress: recv_progress,
     });
     sessions
         .lock()
@@ -662,22 +719,43 @@ async fn receive_unit(
         }
     };
 
+    let unit_key = crate::progress::unit_key(id, striped.then_some(stripe_index));
+    {
+        let name = part_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("file {id}"));
+        let label = if striped {
+            format!("{name} [{}]", stripe_index + 1)
+        } else {
+            name
+        };
+        session.progress.begin_unit(unit_key, label, len);
+    }
+
     let mut file = open_part(&part_path, !striped && offset == 0).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
 
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     let mut remaining = len;
-    while remaining > 0 {
-        let to_read = usize::min(remaining as usize, buf.len());
-        reader
-            .read_exact(&mut buf[..to_read])
-            .await
-            .map_err(|e| anyhow!("transfer read error: {e}"))?;
-        hasher.update(&buf[..to_read]);
-        file.write_all(&buf[..to_read]).await?;
-        remaining -= to_read as u64;
+    let write_result: Result<()> = async {
+        while remaining > 0 {
+            let to_read = usize::min(remaining as usize, buf.len());
+            reader
+                .read_exact(&mut buf[..to_read])
+                .await
+                .map_err(|e| anyhow!("transfer read error: {e}"))?;
+            hasher.update(&buf[..to_read]);
+            file.write_all(&buf[..to_read]).await?;
+            session.progress.advance(unit_key, to_read as u64);
+            remaining -= to_read as u64;
+        }
+        file.flush().await?;
+        Ok(())
     }
-    file.flush().await?;
+    .await;
+    session.progress.end_unit(unit_key);
+    write_result?;
     drop(file);
 
     // Update state; detect completion.
@@ -730,6 +808,8 @@ async fn receive_unit(
     };
 
     if let Some((hash, part_path, final_path, mtime_secs)) = finalize {
+        session.progress.file_done();
+        debug!("file {id} complete -> {}", final_path.display());
         if session.overwrite && fs::metadata(&final_path).await.is_ok() {
             let _ = fs::remove_file(&final_path).await;
         }
@@ -766,7 +846,8 @@ fn ensure_auth(provided: Option<&str>, expected: &str, require_auth: bool) -> Re
 
 /// Handle an incoming PushRequest: verify requested files exist locally,
 /// then act as sender — connect back to the requester's server and stream
-/// the files using the existing v3 protocol.
+/// the files using the existing v3 protocol. `return_auth_code` is the
+/// requester's one-time token, presented back to its server.
 #[allow(clippy::too_many_arguments)]
 async fn handle_push_request(
     mut stream: TcpStream,
@@ -774,10 +855,8 @@ async fn handle_push_request(
     requester_port: u16,
     requested_files: &[RemoteFileSpec],
     dest_local_path: &str,
-    auth_code: Option<&str>,
+    return_auth_code: Option<&str>,
     overwrite: bool,
-    _pairing_code: String,
-    _require_auth: bool,
 ) -> Result<()> {
     // Build the local source paths from the remote file specs.
     let sources: Vec<PathBuf> = requested_files
@@ -813,17 +892,22 @@ async fn handle_push_request(
         }
     }
 
+    info!(
+        "pushing {} files back to {requester_ip}:{requester_port} -> {dest_local_path}",
+        sources.len()
+    );
     let summary = client::send_session(
         requester_ip,
         requester_port,
         &sources,
         dest_local_path,
-        auth_code,
+        return_auth_code,
         client::SendOptions {
             overwrite,
             dry_run: false,
             jobs: None,
             show_progress: false,
+            progress: None,
         },
     )
     .await;
@@ -843,4 +927,94 @@ async fn handle_push_request(
     )
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client;
+
+    /// Full pull round-trip over localhost: requester B (auth on) registers a
+    /// one-time token, remote A pushes the file back authenticating with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pull_round_trip_uses_one_time_token() -> Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("lanxfer-pull-{}", uuid::Uuid::new_v4().simple()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src)?;
+        std::fs::create_dir_all(&dst)?;
+        let file = src.join("hello.txt");
+        std::fs::write(&file, b"pull me")?;
+
+        // Peer A: owns the file, open (no auth).
+        let a = TcpListener::bind("127.0.0.1:0").await?;
+        let a_port = a.local_addr()?.port();
+        tokio::spawn(run_server(
+            a,
+            0,
+            "AAAA".into(),
+            true,
+            false,
+            None,
+            PullTokens::default(),
+            Arc::default(),
+        ));
+
+        // Peer B (the requester): auth required, one-time token registered.
+        let b = TcpListener::bind("127.0.0.1:0").await?;
+        let b_port = b.local_addr()?.port();
+        let tokens = PullTokens::default();
+        tokens.lock().unwrap().insert("TOK".into());
+        tokio::spawn(run_server(
+            b,
+            0,
+            "BBBB".into(),
+            true,
+            true,
+            None,
+            Arc::clone(&tokens),
+            Arc::default(),
+        ));
+
+        let spec = RemoteFileSpec {
+            id: 0,
+            abs_path: file.to_string_lossy().into_owned(),
+            rel_path: "hello.txt".into(),
+            size: 7,
+            mtime_secs: 0,
+        };
+        let summary = client::pull_session(
+            "127.0.0.1",
+            a_port,
+            std::slice::from_ref(&spec),
+            dst.to_str().unwrap(),
+            b_port,
+            None,
+            Some("TOK"),
+            false,
+        )
+        .await?;
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert_eq!(summary.transferred, 1);
+        assert_eq!(std::fs::read(dst.join("hello.txt"))?, b"pull me");
+        assert!(tokens.lock().unwrap().is_empty(), "token not consumed");
+
+        // Without a token the write-back must be rejected by B's server.
+        let summary = client::pull_session(
+            "127.0.0.1",
+            a_port,
+            &[spec],
+            dst.to_str().unwrap(),
+            b_port,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert!(!summary.errors.is_empty(), "pull without token must fail");
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
 }

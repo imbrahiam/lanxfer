@@ -41,7 +41,10 @@ pub struct SendOptions {
     pub overwrite: bool,
     pub dry_run: bool,
     pub jobs: Option<usize>,
+    /// CLI progress bars (indicatif). The TUI uses `progress` instead.
     pub show_progress: bool,
+    /// Live counters for the interactive UI.
+    pub progress: Option<Arc<crate::progress::Progress>>,
 }
 
 #[derive(Default)]
@@ -226,6 +229,14 @@ pub async fn send_session(
         .jobs
         .unwrap_or_else(|| default_jobs(queue.len()))
         .max(1);
+    log::info!(
+        "send session to {target}: {file_count} files, {} bytes, {worker_count} connections",
+        total_bytes_to_send
+    );
+    if let Some(p) = &opts.progress {
+        p.reset_if_idle();
+        p.add_totals(total_bytes_to_send, expected_dones as u64);
+    }
 
     let multi = if opts.show_progress {
         Some(MultiProgress::new())
@@ -255,6 +266,7 @@ pub async fn send_session(
 
     // Control reader collects FileDone results while workers stream.
     let done_overall = overall.clone();
+    let done_progress = opts.progress.clone();
     let control_task = tokio::spawn(async move {
         let mut dones: HashMap<u32, (String, bool, Option<String>)> = HashMap::new();
         while dones.len() < expected_dones {
@@ -266,6 +278,9 @@ pub async fn send_session(
                     error,
                 }) => {
                     dones.insert(id, (hash, ok, error));
+                    if let Some(p) = &done_progress {
+                        p.file_done();
+                    }
                     if let Some(bar) = &done_overall {
                         bar.set_message(ui::dim(&format!("{}/{file_count} files", dones.len())));
                     }
@@ -292,6 +307,7 @@ pub async fn send_session(
         let sent_bytes = Arc::clone(&sent_bytes);
         let multi = multi.clone();
         let overall = overall.clone();
+        let progress = opts.progress.clone();
         workers.spawn(async move {
             run_worker(
                 &target,
@@ -305,6 +321,7 @@ pub async fn send_session(
                 sent_bytes,
                 multi,
                 overall,
+                progress,
             )
             .await
         });
@@ -393,6 +410,7 @@ pub async fn send_session(
 /// Pull files from a remote peer. Sends a PushRequest telling the remote to
 /// read its local files and push them to us. Waits for the transfer to
 /// complete on the remote side.
+#[allow(clippy::too_many_arguments)]
 pub async fn pull_session(
     target: &str,
     port: u16,
@@ -400,11 +418,16 @@ pub async fn pull_session(
     dest_local_path: &str,
     requester_port: u16,
     auth_code: Option<&str>,
+    return_auth_code: Option<&str>,
     overwrite: bool,
 ) -> Result<SendSummary> {
     if remote_files.is_empty() {
         bail!("no files selected for pull");
     }
+    log::info!(
+        "pull from {target}:{port}: {} files -> {dest_local_path} (reply port {requester_port})",
+        remote_files.len()
+    );
 
     let (mut control, _device, _) = connect_and_handshake(target, port).await?;
     send_control(
@@ -415,6 +438,7 @@ pub async fn pull_session(
             requester_port,
             auth_code: auth_code.map(ToString::to_string),
             overwrite,
+            return_auth_code: return_auth_code.map(ToString::to_string),
         },
     )
     .await?;
@@ -450,6 +474,12 @@ pub async fn pull_session(
             }
         }
     }
+    log::info!(
+        "pull finished: {} files, {} bytes, errors: {:?}",
+        summary.transferred,
+        summary.bytes,
+        summary.errors
+    );
 
     Ok(summary)
 }
@@ -467,6 +497,7 @@ async fn run_worker(
     sent_bytes: Arc<AtomicU64>,
     multi: Option<MultiProgress>,
     overall: Option<ProgressBar>,
+    progress: Option<Arc<crate::progress::Progress>>,
 ) -> Result<()> {
     // Don't open a connection if there's no work left.
     if queue.lock().unwrap().is_empty() {
@@ -512,6 +543,15 @@ async fn run_worker(
             bar
         });
 
+        let unit_key = crate::progress::unit_key(unit.id, unit.stripe);
+        if let Some(p) = &progress {
+            let label = match unit.stripe {
+                Some(i) => format!("{} [{}]", entry.relative_path, i + 1),
+                None => entry.relative_path.clone(),
+            };
+            p.begin_unit(unit_key, label, unit.len);
+        }
+
         send_control(
             &mut writer,
             &ControlMessage::SendFile {
@@ -545,6 +585,9 @@ async fn run_worker(
             writer.write_all(&buf[..read]).await?;
             remaining -= read as u64;
             sent_bytes.fetch_add(read as u64, Ordering::Relaxed);
+            if let Some(p) = &progress {
+                p.advance(unit_key, read as u64);
+            }
             if let Some(b) = &bar {
                 b.inc(read as u64);
             }
@@ -553,6 +596,9 @@ async fn run_worker(
             }
         }
         writer.flush().await?;
+        if let Some(p) = &progress {
+            p.end_unit(unit_key);
+        }
 
         match unit.stripe {
             Some(i) => {
@@ -814,6 +860,7 @@ pub async fn send_path(
             dry_run,
             jobs,
             show_progress,
+            progress: None,
         },
     )
     .await?;

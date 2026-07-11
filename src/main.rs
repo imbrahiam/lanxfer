@@ -3,6 +3,7 @@ mod client;
 mod discovery;
 mod interactive;
 mod picker;
+mod progress;
 mod protocol;
 mod server;
 mod storage;
@@ -15,8 +16,26 @@ use clap::Parser;
 use cli::{Cli, Command};
 use protocol::{DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT};
 
+/// File logging for debugging the TUI (stdout/stderr are unusable in raw
+/// mode). `LANXFER_LOG=debug lanxfer` → /tmp/lanxfer.log, or set
+/// LANXFER_LOG_FILE for a custom path.
+fn init_logging() {
+    let Ok(level) = std::env::var("LANXFER_LOG") else {
+        return;
+    };
+    let level = level.parse().unwrap_or(log::LevelFilter::Debug);
+    let path = std::env::var("LANXFER_LOG_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("lanxfer.log"));
+    if let Ok(file) = std::fs::File::create(&path) {
+        let _ = simplelog::WriteLogger::init(level, simplelog::Config::default(), file);
+        log::info!("lanxfer {} logging at {level}", env!("CARGO_PKG_VERSION"));
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    init_logging();
     let cli = Cli::parse();
     let result = run(cli).await;
     let _ = console::Term::stdout().show_cursor();
@@ -89,7 +108,17 @@ async fn run(cli: Cli) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
                 anyhow::anyhow!("cannot listen on {bind}: {e} (another lanxfer running?)")
             })?;
-            server::run_server(listener, discovery_port, code, false, !open, None).await?;
+            server::run_server(
+                listener,
+                discovery_port,
+                code,
+                false,
+                !open,
+                None,
+                server::PullTokens::default(),
+                std::sync::Arc::new(progress::Progress::default()),
+            )
+            .await?;
         }
         Some(Command::Discover {
             discovery_port,

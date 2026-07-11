@@ -131,6 +131,46 @@ impl StatusScreen {
         }
     }
 
+    /// Blocking list with multi-select semantics: Space toggles the row
+    /// under the cursor, Enter picks it, Esc cancels.
+    pub fn choose_multi(
+        &mut self,
+        title: &str,
+        items: Vec<String>,
+        start: usize,
+        help: &str,
+    ) -> Result<MultiChoice> {
+        let Some(terminal) = &mut self.terminal else {
+            return Ok(items
+                .get(start)
+                .map_or(MultiChoice::Cancel, |_| MultiChoice::Pick(start)));
+        };
+        let mut query = String::new();
+        let mut selected = start.min(items.len().saturating_sub(1));
+        loop {
+            let visible = filtered(&items, &query);
+            selected = selected.min(visible.len().saturating_sub(1));
+            terminal.draw(|frame| draw(frame, title, &items, &visible, selected, &query, help))?;
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if is_ctrl_c(&key) {
+                quit_app();
+            }
+            if key.code == KeyCode::Char(' ') && !visible.is_empty() {
+                return Ok(MultiChoice::Toggle(visible[selected]));
+            }
+            match handle_list_key(&key, &items, &mut selected, &mut query) {
+                KeyOutcome::Pick(index) => return Ok(MultiChoice::Pick(index)),
+                KeyOutcome::Cancel => return Ok(MultiChoice::Cancel),
+                KeyOutcome::Handled | KeyOutcome::Ignored => {}
+            }
+        }
+    }
+
     pub fn draw_list(
         &mut self,
         title: &str,
@@ -192,6 +232,29 @@ fn choose_loop(
             KeyOutcome::Handled | KeyOutcome::Ignored => {}
         }
     }
+}
+
+pub(crate) enum MultiChoice {
+    /// Enter — index into the full item list.
+    Pick(usize),
+    /// Space — toggle this index.
+    Toggle(usize),
+    /// Esc.
+    Cancel,
+}
+
+/// Drain pending input during a busy screen (progress cards): Ctrl+C still
+/// quits, everything else is discarded.
+pub(crate) fn pump_quit_only() -> Result<()> {
+    while event::poll(std::time::Duration::ZERO)? {
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && is_ctrl_c(&key)
+        {
+            quit_app();
+        }
+    }
+    Ok(())
 }
 
 pub(crate) enum KeyOutcome {
