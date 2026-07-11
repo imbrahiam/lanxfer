@@ -277,7 +277,7 @@ fn draw_status(
     footer: &str,
 ) {
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::reset()), area);
+    frame.render_widget(Clear, area);
     let height = (details.len() as u16 + 12).clamp(14, 28);
     let card = centered(area, area.width.min(82), area.height.min(height));
     frame.render_widget(Clear, card);
@@ -363,7 +363,7 @@ fn draw_input(
     secret: bool,
 ) {
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::reset()), area);
+    frame.render_widget(Clear, area);
     let card = centered(area, area.width.min(82), area.height.clamp(14, 22));
     frame.render_widget(Clear, card);
     frame.render_widget(
@@ -441,7 +441,7 @@ fn draw(
     help: &str,
 ) {
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::reset()), area);
+    frame.render_widget(Clear, area);
     let width = area.width.min(82);
     let height = area.height.clamp(12, 28);
     let card = centered(area, width, height);
