@@ -4,6 +4,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
+use std::future::Future;
 use std::io::IsTerminal;
 
 // Keep the surface on the terminal's own background. Hard-coded RGB
@@ -22,6 +23,44 @@ pub fn select(title: &str, items: Vec<String>, start: usize, help: &str) -> Resu
     let result = run(&mut terminal, title, &items, start, help);
     ratatui::restore();
     result
+}
+
+/// Show the picker immediately, perform async work inside it, then replace the
+/// loading state with selectable results without leaving the alternate screen.
+pub async fn select_after<T, F, M>(
+    title: &str,
+    loading: &str,
+    start: usize,
+    help: &str,
+    future: F,
+    make_items: M,
+) -> Result<(T, Option<usize>)>
+where
+    F: Future<Output = Result<T>>,
+    M: FnOnce(&T) -> Vec<String>,
+{
+    if !std::io::stdout().is_terminal() {
+        let value = future.await?;
+        let items = make_items(&value);
+        let selected = items.get(start).map(|_| start);
+        return Ok((value, selected));
+    }
+
+    let mut terminal = ratatui::init();
+    terminal.clear()?;
+    terminal.draw(|frame| draw_loading(frame, title, loading))?;
+
+    let value = match future.await {
+        Ok(value) => value,
+        Err(err) => {
+            ratatui::restore();
+            return Err(err);
+        }
+    };
+    let items = make_items(&value);
+    let selection = run(&mut terminal, title, &items, start, help);
+    ratatui::restore();
+    Ok((value, selection?))
 }
 
 fn run(
@@ -78,6 +117,68 @@ fn filtered(items: &[String], query: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(i, item)| item.to_lowercase().contains(&needle).then_some(i))
         .collect()
+}
+
+fn draw_loading(frame: &mut ratatui::Frame, title: &str, message: &str) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::reset()), area);
+    let card = centered(area, area.width.min(82), area.height.clamp(12, 28));
+    frame.render_widget(Clear, card);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED))
+            .style(Style::reset())
+            .padding(Padding::horizontal(2)),
+        card,
+    );
+    let inner = Rect::new(
+        card.x + 3,
+        card.y + 2,
+        card.width.saturating_sub(6),
+        card.height.saturating_sub(4),
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "⇄  LANXFER",
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   {title}"),
+                Style::default()
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("◌  ", Style::default().fg(CYAN)),
+            Span::styled(message, Style::default().fg(Color::Reset)),
+        ])),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Waiting for peers on your local network…")
+            .style(Style::default().fg(MUTED)),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new("Discovery usually takes a few seconds").style(Style::default().fg(MUTED)),
+        rows[3],
+    );
 }
 
 fn draw(
