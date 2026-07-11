@@ -10,11 +10,12 @@ use tokio::sync::mpsc;
 
 use crate::discovery;
 use crate::protocol::{
-    ControlMessage, DirSpec, FileAction, FileSpec, PROTOCOL_VERSION, PlanAction, read_control,
-    send_control,
+    ControlMessage, DirSpec, FileAction, FileSpec, RemoteFileSpec, PROTOCOL_VERSION, PlanAction,
+    read_control, send_control,
 };
 use crate::storage;
 use crate::util;
+use crate::client;
 
 pub fn ensure_pairing_code(opt: Option<String>) -> String {
     opt.unwrap_or_else(util::generate_pairing_code)
@@ -207,6 +208,54 @@ async fn handle_client(
                     dirs,
                 )
                 .await;
+            }
+            ControlMessage::PushRequest {
+                files,
+                dest_local_path,
+                requester_port,
+                auth_code,
+                overwrite,
+            } => {
+                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code, require_auth) {
+                    send_control(
+                        &mut stream,
+                        &ControlMessage::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                let requester_ip = match stream.peer_addr() {
+                    Ok(addr) => addr.ip().to_string(),
+                    Err(err) => {
+                        send_control(
+                            &mut stream,
+                            &ControlMessage::Error {
+                                message: format!("cannot determine requester address: {err}"),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                send_control(&mut stream, &ControlMessage::JoinAck).await?;
+                let code = pairing_code.clone();
+                tokio::spawn(async move {
+                    let _ = handle_push_request(
+                        stream,
+                        &requester_ip,
+                        requester_port,
+                        &files,
+                        &dest_local_path,
+                        auth_code.as_deref(),
+                        overwrite,
+                        code,
+                        require_auth,
+                    )
+                    .await;
+                });
+                return Ok(());
             }
             ControlMessage::JoinSession { session_id } => {
                 let session = sessions.lock().unwrap().get(&session_id).cloned();
@@ -676,5 +725,86 @@ fn ensure_auth(provided: Option<&str>, expected: &str, require_auth: bool) -> Re
     if value != expected {
         bail!("invalid pairing code");
     }
+    Ok(())
+}
+
+/// Handle an incoming PushRequest: verify requested files exist locally,
+/// then act as sender — connect back to the requester's server and stream
+/// the files using the existing v3 protocol.
+#[allow(clippy::too_many_arguments)]
+async fn handle_push_request(
+    mut stream: TcpStream,
+    requester_ip: &str,
+    requester_port: u16,
+    requested_files: &[RemoteFileSpec],
+    dest_local_path: &str,
+    auth_code: Option<&str>,
+    overwrite: bool,
+    _pairing_code: String,
+    _require_auth: bool,
+) -> Result<()> {
+    // Build the local source paths from the remote file specs.
+    let sources: Vec<PathBuf> = requested_files
+        .iter()
+        .map(|f| PathBuf::from(&f.abs_path))
+        .collect();
+
+    // Verify all files exist before starting the transfer.
+    for path in &sources {
+        if !path.exists() {
+            let _ = send_control(
+                &mut stream,
+                &ControlMessage::PushComplete {
+                    files_sent: 0,
+                    bytes: 0,
+                    errors: vec![format!("file not found: {}", path.display())],
+                },
+            )
+            .await;
+            return Ok(());
+        }
+        if !path.is_file() {
+            let _ = send_control(
+                &mut stream,
+                &ControlMessage::PushComplete {
+                    files_sent: 0,
+                    bytes: 0,
+                    errors: vec![format!("not a file: {}", path.display())],
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
+    let summary = client::send_session(
+        requester_ip,
+        requester_port,
+        &sources,
+        dest_local_path,
+        auth_code,
+        client::SendOptions {
+            overwrite,
+            dry_run: false,
+            jobs: None,
+            show_progress: false,
+        },
+    )
+    .await;
+
+    let (files_sent, bytes, errors) = match summary {
+        Ok(s) => (s.transferred, s.bytes, s.errors),
+        Err(err) => (0, 0, vec![err.to_string()]),
+    };
+
+    let _ = send_control(
+        &mut stream,
+        &ControlMessage::PushComplete {
+            files_sent,
+            bytes,
+            errors,
+        },
+    )
+    .await;
     Ok(())
 }

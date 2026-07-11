@@ -1,11 +1,14 @@
 use anyhow::{Result, bail};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::client;
 use crate::discovery;
+use crate::picker::filtered;
 use crate::protocol::{
-    ControlMessage, DestinationInfo, PROTOCOL_VERSION, read_control, send_control,
+    ControlMessage, DestinationInfo, RemoteFileSpec, PROTOCOL_VERSION, read_control, send_control,
 };
 use crate::server;
 use crate::util;
@@ -120,16 +123,7 @@ async fn peer_loop(
     let my_host = util::host_name();
 
     loop {
-        let scan_ips = local_ips.clone();
-        let scan_host = my_host.clone();
-        let scan = async move {
-            let mut hosts =
-                discovery::discover_hosts_with_fallback(discovery_port, timeout_ms).await?;
-            if exclude_self {
-                hosts.retain(|h| !scan_ips.contains(&h.ip) && h.reply.host != scan_host);
-            }
-            Ok::<Vec<discovery::DiscoveredHost>, anyhow::Error>(hosts)
-        };
+        // Initial scan.
         screen.render(
             picker_title,
             "Scanning for nearby peers…",
@@ -137,60 +131,84 @@ async fn peer_loop(
             &[],
             "Automatic discovery is active",
         )?;
-        let hosts = scan.await?;
-        if hosts.is_empty() {
-            screen.render(
-                picker_title,
-                "No peers found yet",
-                crate::picker::Tone::Info,
-                &[],
-                "Rescanning automatically…  ·  esc quit",
-            )?;
-            if matches!(
-                screen.poll_key(std::time::Duration::from_millis(700))?,
-                Some(crossterm::event::KeyCode::Esc)
-            ) {
-                return Ok(());
-            }
-            continue;
-        }
-        let mut items: Vec<String> = hosts
-            .iter()
-            .map(|h| {
-                format!(
-                    "{:<20}  {}:{}  {} {}",
-                    h.reply.host,
-                    h.ip,
-                    h.reply.control_port,
-                    h.reply.device.os,
-                    h.reply.device.arch
-                )
-            })
-            .collect();
+        let mut hosts = scan_hosts(discovery_port, timeout_ms, exclude_self, &local_ips, &my_host).await;
+        let mut items = hosts_to_items(&hosts);
         items.push("Enter IP manually".to_string());
-        items.push("↻ Rescan".to_string());
-        items.push("✗ Quit".to_string());
-        let selection = if hosts.len() == 1 {
-            screen.render(
-                picker_title,
-                &format!("Connecting to {}…", hosts[0].reply.host),
-                crate::picker::Tone::Info,
-                &[("address".into(), hosts[0].ip.clone())],
-                "Peer discovered automatically",
-            )?;
-            Some(0)
-        } else {
-            select(screen, picker_title, items, 0, NAV_HELP)?
+        items.push("\u{21bb} Rescan".to_string());
+        items.push("\u{2717} Quit".to_string());
+
+        // Custom picker loop with background rescan.
+        let mut query = String::new();
+        let mut selected = 0usize;
+        let mut last_refresh = Instant::now();
+        let refresh_interval = Duration::from_millis(700);
+
+        let picked: Option<(usize, usize)> = loop {
+            let visible = filtered(&items, &query);
+            selected = selected.min(visible.len().saturating_sub(1));
+            screen.draw_list(picker_title, &items, &visible, selected, &query, NAV_HELP)?;
+
+            // Wait for input or timeout for refresh.
+            let remaining = refresh_interval
+                .checked_sub(last_refresh.elapsed())
+                .unwrap_or(Duration::ZERO);
+            let timed_out = !event::poll(remaining)?;
+
+            if timed_out {
+                // Background rescan — update items silently.
+                hosts = scan_hosts(discovery_port, timeout_ms, exclude_self, &local_ips, &my_host).await;
+                items = hosts_to_items(&hosts);
+                items.push("Enter IP manually".to_string());
+                items.push("\u{21bb} Rescan".to_string());
+                items.push("\u{2717} Quit".to_string());
+                selected = selected.min(items.len().saturating_sub(1));
+                last_refresh = Instant::now();
+                continue;
+            }
+
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Esc => break None,
+                KeyCode::Enter if !visible.is_empty() => {
+                    break Some((visible[selected], items.len()));
+                }
+                KeyCode::Up | KeyCode::Char('k') if query.is_empty() => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if query.is_empty() => {
+                    selected = (selected + 1).min(visible.len().saturating_sub(1));
+                }
+                KeyCode::Home => selected = 0,
+                KeyCode::End => selected = visible.len().saturating_sub(1),
+                KeyCode::Backspace => {
+                    query.pop();
+                    selected = 0;
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    query.push(c);
+                    selected = 0;
+                }
+                _ => {}
+            }
         };
-        let Some(sel) = selection else {
+
+        let Some((sel, items_len)) = picked else {
             return Ok(()); // esc at top level = quit
         };
-        let items_len = hosts.len() + 3;
 
         let (ip, control_port, label) = if sel == items_len - 1 {
             return Ok(());
         } else if sel == items_len - 2 {
-            continue;
+            continue; // Rescan
         } else if sel == items_len - 3 {
             let Some(ip) = text(screen, "Receiver IP", "esc to go back", false)? else {
                 continue;
@@ -198,7 +216,12 @@ async fn peer_loop(
             let ip = ip.trim().to_string();
             (ip.clone(), default_port, ip)
         } else {
-            let h = &hosts[sel];
+            // Host entry — re-scan to get fresh list, pick by index.
+            let fresh_hosts = scan_hosts(discovery_port, timeout_ms, exclude_self, &local_ips, &my_host).await;
+            if sel >= fresh_hosts.len() {
+                continue;
+            }
+            let h = &fresh_hosts[sel];
             (h.ip.clone(), h.reply.control_port, h.reply.host.clone())
         };
 
@@ -215,17 +238,66 @@ async fn peer_loop(
             Ok(true) => return Ok(()), // user chose quit
             Ok(false) => {}            // switch peer -> rescan
             Err(err) => {
-                screen.render(
-                    "Connection",
-                    &format!("{err:#}"),
-                    crate::picker::Tone::Error,
-                    &[],
-                    "Rescanning automatically…",
-                )?;
-                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                let msg = format!("{err:#}");
+                let is_disconnect = msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("connection aborted")
+                    || msg.contains("unexpected end of file")
+                    || msg.contains("Connection closed");
+                if is_disconnect {
+                    screen.render(
+                        "Connection",
+                        &format!("Peer {label} disconnected"),
+                        crate::picker::Tone::Info,
+                        &[],
+                        "Returning to peer list…",
+                    )?;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                } else {
+                    screen.render(
+                        "Connection",
+                        &msg,
+                        crate::picker::Tone::Error,
+                        &[],
+                        "Rescanning automatically…",
+                    )?;
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                }
             }
         }
     }
+}
+
+async fn scan_hosts(
+    discovery_port: u16,
+    timeout_ms: u64,
+    exclude_self: bool,
+    local_ips: &[String],
+    my_host: &str,
+) -> Vec<discovery::DiscoveredHost> {
+    let mut hosts = discovery::discover_hosts_with_fallback(discovery_port, timeout_ms)
+        .await
+        .unwrap_or_default();
+    if exclude_self {
+        hosts.retain(|h| !local_ips.contains(&h.ip) && h.reply.host != my_host);
+    }
+    hosts
+}
+
+fn hosts_to_items(hosts: &[discovery::DiscoveredHost]) -> Vec<String> {
+    hosts
+        .iter()
+        .map(|h| {
+            format!(
+                "{:<20}  {}:{}  {} {}",
+                h.reply.host,
+                h.ip,
+                h.reply.control_port,
+                h.reply.device.os,
+                h.reply.device.arch
+            )
+        })
+        .collect()
 }
 
 /// One connected session with a peer. Stays connected across sends —
@@ -242,11 +314,14 @@ async fn peer_session(
     let (_device, auth_required) = handshake_info(ip, port).await?;
 
     let mut last_dest: Option<String> = None;
+    let mut last_source: Option<String> = None;
 
     loop {
         enum Action {
             Send,
             SendAgain,
+            Receive,
+            ReceiveAgain,
             Drives,
             History,
             SwitchPeer,
@@ -255,6 +330,10 @@ async fn peer_session(
         let mut menu: Vec<(String, Action)> = vec![("Send files".to_string(), Action::Send)];
         if let Some(dest) = &last_dest {
             menu.push((format!("Send more to {dest}"), Action::SendAgain));
+        }
+        menu.push(("Receive files".to_string(), Action::Receive));
+        if let Some(source) = &last_source {
+            menu.push((format!("Receive more from {source}"), Action::ReceiveAgain));
         }
         menu.push(("List remote drives".to_string(), Action::Drives));
         menu.push((
@@ -306,6 +385,35 @@ async fn peer_session(
                 )
                 .await
             }
+            Action::Receive => {
+                receive_flow(
+                    screen,
+                    ip,
+                    port,
+                    label,
+                    auth_required,
+                    codes,
+                    transfers,
+                    &mut last_source,
+                    None,
+                )
+                .await
+            }
+            Action::ReceiveAgain => {
+                let source = last_source.clone();
+                receive_flow(
+                    screen,
+                    ip,
+                    port,
+                    label,
+                    auth_required,
+                    codes,
+                    transfers,
+                    &mut last_source,
+                    source,
+                )
+                .await
+            }
             Action::Drives => list_drives(screen, ip, port).await,
             Action::History => print_transfers(screen, transfers),
             Action::SwitchPeer => return Ok(false),
@@ -323,7 +431,6 @@ async fn peer_session(
             )?;
             screen.wait_for_close()?;
             if msg.contains("pairing code") {
-                // wrong/stale code — forget it so the next attempt re-prompts
                 codes.remove(ip);
             }
         }
@@ -577,6 +684,331 @@ async fn send_flow(
         "enter / esc  continue",
     )?;
     screen.wait_for_close()
+}
+
+/// Browse a remote filesystem and toggle-select files for transfer.
+/// Returns Ok(None) when the user backs out with Esc.
+async fn pick_remote_files(
+    screen: &mut crate::picker::StatusScreen,
+    ip: &str,
+    port: u16,
+    auth_code: Option<&str>,
+) -> Result<Option<Vec<RemoteFileSpec>>> {
+    // First: pick a starting drive.
+    let destinations = fetch_destinations(ip, port).await?;
+    let writable: Vec<&DestinationInfo> = destinations.iter().filter(|d| !d.read_only).collect();
+    if writable.is_empty() {
+        bail!("no drives found on remote");
+    }
+
+    let drive_items: Vec<String> = writable
+        .iter()
+        .map(|d| {
+            format!(
+                "{:<12} {:<32} {} free",
+                d.label,
+                d.path,
+                util::format_size(d.available_bytes)
+            )
+        })
+        .collect();
+
+    let Some(drive_idx) = select(screen, "Browse remote · select drive", drive_items, 0, NAV_HELP)?
+    else {
+        return Ok(None);
+    };
+
+    let dest_root = writable[drive_idx].path.clone();
+    let mut stream = client::connect_and_handshake(ip, port).await?.0;
+    let mut current_relative = String::new();
+    let mut selected_files: Vec<(String, String, u64, i64)> = Vec::new(); // (abs_path, rel_path, size, mtime)
+    let mut last_idx = 0;
+
+    loop {
+        send_control(
+            &mut stream,
+            &ControlMessage::BrowseDirectory {
+                destination_path: dest_root.clone(),
+                relative_path: current_relative.clone(),
+                auth_code: auth_code.map(|s| s.to_string()),
+            },
+        )
+        .await?;
+
+        let entries = match read_control(&mut stream).await? {
+            ControlMessage::DirectoryContents { entries, .. } => entries,
+            ControlMessage::Error { message } => bail!("{message}"),
+            _ => bail!("unexpected response"),
+        };
+
+        let display_path = join_remote_path(&dest_root, &current_relative);
+        let done_label = if selected_files.is_empty() {
+            "✓ Done (nothing selected — cancels)".to_string()
+        } else {
+            format!("✓ Done — receive {} file(s)", selected_files.len())
+        };
+
+        let mut items = vec![done_label, ".. go up".to_string()];
+        for entry in &entries {
+            if entry.is_dir {
+                items.push(format!("{}/", entry.name));
+            } else {
+                let mark = if selected_files
+                    .iter()
+                    .any(|(_, rel, _, _)| *rel == join_remote_path(&current_relative, &entry.name))
+                {
+                    "● "
+                } else {
+                    "  "
+                };
+                items.push(format!(
+                    "{mark}{:<32}  {}",
+                    entry.name,
+                    util::format_size(entry.size)
+                ));
+            }
+        }
+
+        let prompt = format!(
+            "remote · {} · {} selected",
+            display_path,
+            selected_files.len()
+        );
+        let Some(selection) = select(
+            screen,
+            &prompt,
+            items.clone(),
+            last_idx.min(items.len().saturating_sub(1)),
+            "enter opens dir / toggles file · type to filter · esc up",
+        )?
+        else {
+            // esc: go up, or back out at root
+            if current_relative.is_empty() {
+                return Ok(None);
+            }
+            go_up(&mut current_relative);
+            last_idx = 0;
+            continue;
+        };
+        last_idx = selection;
+
+        match selection {
+            0 => {
+                if selected_files.is_empty() {
+                    if confirm(screen, "Nothing selected. Cancel?", true)? {
+                        return Ok(None);
+                    }
+                } else {
+                    let result: Vec<RemoteFileSpec> = selected_files
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (abs, rel, size, mtime))| RemoteFileSpec {
+                            id: i as u32,
+                            abs_path: abs,
+                            rel_path: rel,
+                            size,
+                            mtime_secs: mtime,
+                        })
+                        .collect();
+                    return Ok(Some(result));
+                }
+            }
+            1 => {
+                // Go up
+                if current_relative.is_empty() {
+                    // At root — return to drive selection
+                    return Ok(None);
+                }
+                go_up(&mut current_relative);
+                last_idx = 0;
+            }
+            idx => {
+                let entry = &entries[idx - 2];
+                if entry.is_dir {
+                    // Enter directory
+                    if current_relative.is_empty() {
+                        current_relative = entry.name.clone();
+                    } else {
+                        current_relative =
+                            format!("{}/{}", current_relative, entry.name);
+                    }
+                    last_idx = 0;
+                } else {
+                    // Toggle file selection
+                    let abs = join_remote_path(
+                        &dest_root,
+                        &join_remote_path(&current_relative, &entry.name),
+                    );
+                    let rel =
+                        join_remote_path(&current_relative, &entry.name);
+                    if let Some(pos) = selected_files
+                        .iter()
+                        .position(|(_, r, _, _)| *r == rel)
+                    {
+                        selected_files.remove(pos);
+                    } else {
+                        selected_files.push((
+                            abs,
+                            rel,
+                            entry.size,
+                            entry.mtime_secs,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Full receive flow: browse remote, pick files, pick local dest, transfer.
+#[allow(clippy::too_many_arguments)]
+async fn receive_flow(
+    screen: &mut crate::picker::StatusScreen,
+    ip: &str,
+    port: u16,
+    peer_label: &str,
+    auth_required: bool,
+    codes: &mut HashMap<String, String>,
+    transfers: &mut Vec<TransferRecord>,
+    last_source: &mut Option<String>,
+    reuse_source: Option<String>,
+) -> Result<()> {
+    let Some(auth_code) = ensure_code(screen, ip, auth_required, codes)? else {
+        return Ok(());
+    };
+    let auth = auth_code.as_deref();
+
+    // Pick remote files to receive.
+    let remote_files = match pick_remote_files(screen, ip, port, auth).await? {
+        Some(f) if !f.is_empty() => f,
+        _ => return Ok(()),
+    };
+
+    // Pick local save destination.
+    let local_dest = match reuse_source {
+        Some(path) => path,
+        None => {
+            let Some(path) = pick_local_save_dir(screen)? else {
+                return Ok(());
+            };
+            path
+        }
+    };
+
+    if !confirm(
+        screen,
+        &format!(
+            "Receive {} file(s) to {}?",
+            remote_files.len(),
+            local_dest
+        ),
+        true,
+    )? {
+        return Ok(());
+    }
+
+    let source_label = format!("{}:{}", peer_label, remote_files[0].rel_path);
+    let total_size: u64 = remote_files.iter().map(|f| f.size).sum();
+    screen.render(
+        "Transfer",
+        "Receiving files…",
+        crate::picker::Tone::Info,
+        &[
+            ("source".into(), source_label.clone()),
+            ("destination".into(), local_dest.clone()),
+            ("size".into(), util::format_size(total_size)),
+        ],
+        "Transfer is active · resumable if interrupted",
+    )?;
+
+    let result = client::push_session(
+        ip,
+        port,
+        &remote_files,
+        &local_dest,
+        port, // requester_port = our server port (same as the port we're connected to)
+        auth,
+        false, // overwrite
+    )
+    .await;
+
+    let record = match &result {
+        Ok(s) => TransferRecord {
+            peer: peer_label.to_string(),
+            source: source_label,
+            dest: local_dest.clone(),
+            files: s.transferred,
+            skipped: 0,
+            bytes: s.bytes,
+            ok: s.errors.is_empty(),
+        },
+        Err(_) => TransferRecord {
+            peer: peer_label.to_string(),
+            source: source_label,
+            dest: local_dest.clone(),
+            files: 0,
+            skipped: 0,
+            bytes: 0,
+            ok: false,
+        },
+    };
+    transfers.push(record);
+    *last_source = Some(local_dest);
+
+    let summary = result?;
+    let mut details = vec![("received".into(), summary.transferred.to_string())];
+    if !summary.errors.is_empty() {
+        for err in &summary.errors {
+            details.push(("error".into(), err.clone()));
+        }
+        bail!("some transfers failed — try again (transfers resume)");
+    }
+    screen.render(
+        "Transfer",
+        "All transfers complete",
+        crate::picker::Tone::Success,
+        &details,
+        "enter / esc  continue",
+    )?;
+    screen.wait_for_close()
+}
+
+/// Pick a local directory to save received files into.
+fn pick_local_save_dir(screen: &mut crate::picker::StatusScreen) -> Result<Option<String>> {
+    let home = dirs::home_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let desktop = dirs::desktop_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let downloads = dirs::download_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let documents = dirs::document_dir().map(|p| p.display().to_string()).unwrap_or_default();
+
+    let mut options: Vec<(String, String)> = Vec::new();
+    if !home.is_empty() {
+        options.push((format!("Home      {home}"), home.clone()));
+    }
+    if !desktop.is_empty() {
+        options.push((format!("Desktop   {desktop}"), desktop));
+    }
+    if !downloads.is_empty() {
+        options.push((format!("Downloads {downloads}"), downloads));
+    }
+    if !documents.is_empty() {
+        options.push((format!("Documents {documents}"), documents));
+    }
+    options.push(("Enter path manually".to_string(), String::new()));
+
+    let labels: Vec<String> = options.iter().map(|(l, _)| l.clone()).collect();
+    let Some(idx) = select(screen, "Save to (local)", labels, 0, NAV_HELP)? else {
+        return Ok(None);
+    };
+
+    if options[idx].1.is_empty() {
+        // Manual entry
+        match text(screen, "Local path", "esc to go back", false)? {
+            Some(path) => Ok(Some(path.trim().to_string())),
+            None => Ok(None),
+        }
+    } else {
+        Ok(Some(options[idx].1.clone()))
+    }
 }
 
 fn print_transfers(

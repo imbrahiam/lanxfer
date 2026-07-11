@@ -47,6 +47,15 @@ pub struct DirSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteFileSpec {
+    pub id: u32,
+    pub abs_path: String,
+    pub rel_path: String,
+    pub size: u64,
+    pub mtime_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanAction {
     /// Send the whole file from byte 0.
@@ -134,6 +143,23 @@ pub enum ControlMessage {
         hash: String,
         ok: bool,
         error: Option<String>,
+    },
+
+    /// Ask the remote to push these files to us.
+    /// Remote reads files from its own disk, connects back to
+    /// requester's server, and acts as the sender.
+    PushRequest {
+        files: Vec<RemoteFileSpec>,
+        dest_local_path: String,
+        requester_port: u16,
+        auth_code: Option<String>,
+        overwrite: bool,
+    },
+    /// Sent by the remote after finishing a PushRequest transfer.
+    PushComplete {
+        files_sent: usize,
+        bytes: u64,
+        errors: Vec<String>,
     },
 
     Error {

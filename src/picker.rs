@@ -5,7 +5,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
 use std::io::IsTerminal;
-use std::time::Duration;
 
 // Keep the surface on the terminal's own background. Hard-coded RGB
 // backgrounds render inconsistently in terminals without true-color support
@@ -125,14 +124,19 @@ impl StatusScreen {
         }
     }
 
-    pub fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyCode>> {
-        if self.terminal.is_none() || !event::poll(timeout)? {
-            return Ok(None);
+    pub fn draw_list(
+        &mut self,
+        title: &str,
+        items: &[String],
+        visible: &[usize],
+        selected: usize,
+        query: &str,
+        help: &str,
+    ) -> Result<()> {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.draw(|frame| draw(frame, title, items, visible, selected, query, help))?;
         }
-        let Event::Key(key) = event::read()? else {
-            return Ok(None);
-        };
-        Ok((key.kind == KeyEventKind::Press).then_some(key.code))
+        Ok(())
     }
 }
 
@@ -191,7 +195,7 @@ fn run(
     }
 }
 
-fn filtered(items: &[String], query: &str) -> Vec<usize> {
+pub(crate) fn filtered(items: &[String], query: &str) -> Vec<usize> {
     let needle = query.to_lowercase();
     items
         .iter()

@@ -12,7 +12,8 @@ use walkdir::WalkDir;
 
 use crate::discovery;
 use crate::protocol::{
-    ControlMessage, DirSpec, FileSpec, PROTOCOL_VERSION, PlanAction, read_control, send_control,
+    ControlMessage, DirSpec, FileSpec, PROTOCOL_VERSION, PlanAction, RemoteFileSpec, read_control,
+    send_control,
 };
 use crate::ui;
 use crate::util;
@@ -385,6 +386,70 @@ pub async fn send_session(
         }
     }
     summary.bytes = sent_bytes.load(Ordering::Relaxed);
+
+    Ok(summary)
+}
+
+/// Pull files from a remote peer. Sends a PushRequest telling the remote to
+/// read its local files and push them to us. Waits for the transfer to
+/// complete on the remote side.
+pub async fn push_session(
+    target: &str,
+    port: u16,
+    remote_files: &[RemoteFileSpec],
+    dest_local_path: &str,
+    requester_port: u16,
+    auth_code: Option<&str>,
+    overwrite: bool,
+) -> Result<SendSummary> {
+    if remote_files.is_empty() {
+        bail!("no files selected for pull");
+    }
+
+    let (mut control, _device) = connect_and_handshake(target, port).await?;
+    send_control(
+        &mut control,
+        &ControlMessage::PushRequest {
+            files: remote_files.to_vec(),
+            dest_local_path: dest_local_path.to_string(),
+            requester_port,
+            auth_code: auth_code.map(ToString::to_string),
+            overwrite,
+        },
+    )
+    .await?;
+
+    match read_control(&mut control).await? {
+        ControlMessage::JoinAck => {}
+        ControlMessage::Error { message } => bail!("{message}"),
+        other => bail!("unexpected push response: {other:?}"),
+    }
+
+    // Wait for the remote to finish pushing files to us.
+    let mut summary = SendSummary::default();
+    loop {
+        match read_control(&mut control).await {
+            Ok(ControlMessage::PushComplete {
+                files_sent,
+                bytes,
+                errors,
+            }) => {
+                summary.transferred = files_sent;
+                summary.bytes = bytes;
+                summary.errors = errors;
+                break;
+            }
+            Ok(ControlMessage::Error { message }) => {
+                summary.errors.push(message);
+                break;
+            }
+            Ok(_) => continue,
+            Err(err) => {
+                summary.errors.push(format!("remote disconnected: {err}"));
+                break;
+            }
+        }
+    }
 
     Ok(summary)
 }
