@@ -1,6 +1,6 @@
 [package]
 name = "lanxfer"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 description = "Fast resumable LAN file transfer CLI"
 license = "MIT"
@@ -25,7 +25,6 @@ uuid = { version = "1.18", features = ["v4"] }
 walkdir = "2.5"
 filetime = "0.2"
 if-addrs = "0.15.0"
-inquire = "0.9.4"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 crossterm = "0.29.0"
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
