@@ -1093,17 +1093,17 @@ async fn pick_remote_files(
 
         let mut items = vec![done_label, ".. go up".to_string()];
         for entry in &entries {
-            if entry.is_dir {
-                items.push(format!("{}/", entry.name));
+            let mark = if selected_files
+                .iter()
+                .any(|(_, rel, _, _)| *rel == join_remote_path(&current_relative, &entry.name))
+            {
+                "● "
             } else {
-                let mark = if selected_files
-                    .iter()
-                    .any(|(_, rel, _, _)| *rel == join_remote_path(&current_relative, &entry.name))
-                {
-                    "● "
-                } else {
-                    "  "
-                };
+                "  "
+            };
+            if entry.is_dir {
+                items.push(format!("{mark}{}/", entry.name));
+            } else {
                 items.push(format!(
                     "{mark}{:<32}  {}",
                     entry.name,
@@ -1121,7 +1121,7 @@ async fn pick_remote_files(
             &prompt,
             items.clone(),
             last_idx.min(items.len().saturating_sub(1)),
-            "space/enter select · enter dir · esc up",
+            "space select · enter open/confirm · esc up",
         )?;
 
         let to_specs = |files: Vec<(String, String, u64, i64)>| -> Vec<RemoteFileSpec> {
@@ -1151,15 +1151,12 @@ async fn pick_remote_files(
                 last_idx = idx;
                 if idx >= 2 {
                     let entry = &entries[idx - 2];
-                    if !entry.is_dir {
-                        let rel = join_remote_path(&current_relative, &entry.name);
-                        if let Some(pos) = selected_files.iter().position(|(_, r, _, _)| *r == rel)
-                        {
-                            selected_files.remove(pos);
-                        } else {
-                            let abs = join_remote_path(&dest_root, &rel);
-                            selected_files.push((abs, rel, entry.size, entry.mtime_secs));
-                        }
+                    let rel = join_remote_path(&current_relative, &entry.name);
+                    if let Some(pos) = selected_files.iter().position(|(_, r, _, _)| *r == rel) {
+                        selected_files.remove(pos);
+                    } else {
+                        let abs = join_remote_path(&dest_root, &rel);
+                        selected_files.push((abs, rel, entry.size, entry.mtime_secs));
                     }
                 }
             }
@@ -1687,7 +1684,7 @@ fn pick_local_paths(screen: &mut crate::picker::StatusScreen) -> Result<Option<V
             &prompt,
             items.clone(),
             last_idx.min(items.len() - 1),
-            "space/enter select · enter dir · esc up",
+            "space select · enter open/confirm · esc up",
         )?;
 
         match choice {
