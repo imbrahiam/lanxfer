@@ -1,25 +1,6 @@
 use console::style;
-use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 
 use crate::picker::{StatusScreen, Tone};
-
-/// Global inquire style — cyan accents, subtle chrome.
-pub fn init_prompts() {
-    let mut rc = RenderConfig::default_colored();
-    rc.prompt_prefix = Styled::new("◆").with_fg(Color::LightCyan);
-    rc.answered_prompt_prefix = Styled::new("◇").with_fg(Color::DarkGrey);
-    rc.highlighted_option_prefix = Styled::new("❯").with_fg(Color::LightCyan);
-    rc.selected_checkbox = Styled::new("●").with_fg(Color::LightGreen);
-    rc.unselected_checkbox = Styled::new("○").with_fg(Color::DarkGrey);
-    rc.help_message = StyleSheet::new().with_fg(Color::DarkGrey);
-    rc.answer = StyleSheet::new().with_fg(Color::LightCyan);
-    rc.selected_option = Some(
-        StyleSheet::new()
-            .with_fg(Color::LightCyan)
-            .with_attr(Attributes::BOLD),
-    );
-    inquire::set_global_render_config(rc);
-}
 
 pub fn section(title: &str) {
     println!();
@@ -52,17 +33,6 @@ pub fn fatal(msg: &str) {
         return;
     }
     eprintln!("Error: {msg}");
-}
-
-pub fn modal(
-    title: &str,
-    message: &str,
-    tone: Tone,
-    details: Vec<(String, String)>,
-) -> anyhow::Result<()> {
-    let mut screen = StatusScreen::new()?;
-    screen.render(title, message, tone, &details, "enter / esc  close")?;
-    screen.wait_for_close()
 }
 
 pub fn kv(key: &str, value: &str) {

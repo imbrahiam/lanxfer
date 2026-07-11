@@ -72,7 +72,7 @@ fn get_interface_broadcast_addrs() -> Vec<Ipv4Addr> {
                 }
             }
         }
-        Err(err) => eprintln!("warning: failed to enumerate interfaces: {err}"),
+        Err(_err) => {}
     }
     addrs.sort();
     addrs.dedup();
@@ -166,7 +166,6 @@ pub async fn discover_hosts_with_fallback(
         return Ok(hosts);
     }
 
-    eprintln!("broadcast discovery found nothing, trying subnet scan...");
     subnet_scan(discovery_port, timeout_ms).await
 }
 
