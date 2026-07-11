@@ -74,10 +74,16 @@ pub fn run(check_only: bool, assume_yes: bool) -> Result<()> {
         &versions,
         "Downloading and replacing the current executable",
     )?;
+    // The terminal is in raw mode under ratatui: self_update must never
+    // print (garbles the alternate screen) nor prompt on stdin (blocks
+    // forever — line input doesn't work in raw mode). We already confirmed
+    // in our own UI above.
     let status = self_update::backends::github::Update::configure()
         .repo_owner(OWNER)
         .repo_name(REPO)
         .bin_name("lanxfer")
+        .no_confirm(true)
+        .show_output(false)
         .show_download_progress(false)
         .current_version(installed)
         .build()
