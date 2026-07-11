@@ -16,12 +16,14 @@ use cli::{Cli, Command};
 use protocol::{DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
     let result = run(cli).await;
-    // dialoguer hides the cursor; restore it even when interrupted mid-prompt
     let _ = console::Term::stdout().show_cursor();
-    result
+    if let Err(err) = result {
+        ui::fatal(&format!("{err:#}"));
+        std::process::exit(1);
+    }
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -50,19 +52,40 @@ async fn run(cli: Cli) -> Result<()> {
         }) => {
             let code = server::ensure_pairing_code(pairing_code);
             let device = util::local_device_info();
-            ui::banner();
-            ui::section("Receiver");
-            ui::kv("host", &device.host_name);
-            ui::kv("platform", &format!("{} {}", device.os, device.arch));
-            ui::kv("listening", &format!("tcp {bind}  ·  udp {discovery_port}"));
+            let mut screen = picker::StatusScreen::new()?;
+            let mut details = vec![
+                ("host".into(), device.host_name),
+                ("platform".into(), format!("{} {}", device.os, device.arch)),
+                (
+                    "listening".into(),
+                    format!("tcp {bind}  ·  udp {discovery_port}"),
+                ),
+                (
+                    "pairing code".into(),
+                    if open {
+                        "off (--open)".into()
+                    } else {
+                        code.clone()
+                    },
+                ),
+            ];
             if open {
-                ui::kv("pairing code", &ui::dim("off (--open)"));
-                ui::warn("anyone on this network can send files to you");
-            } else {
-                ui::kv("pairing code", &ui::yellow(&code));
+                details.push((
+                    "security".into(),
+                    "anyone on this network can send files".into(),
+                ));
             }
-            println!();
-            ui::info("waiting for senders…  (Ctrl-C to stop)");
+            screen.render(
+                "Receiver",
+                "Waiting for senders…",
+                if open {
+                    picker::Tone::Warning
+                } else {
+                    picker::Tone::Info
+                },
+                &details,
+                "Ctrl-C  stop",
+            )?;
             server::run_server(bind, discovery_port, code, false, !open).await?;
         }
         Some(Command::Discover {
