@@ -1,6 +1,6 @@
 [package]
 name = "lanxfer"
-version = "0.10.5"
+version = "0.11.0"
 edition = "2024"
 description = "Fast resumable LAN file transfer CLI"
 license = "MIT"
@@ -31,3 +31,4 @@ self_update = { version = "0.44.0", default-features = false, features = ["ureq"
 log = "0.4.33"
 simplelog = "0.12.2"
 keepawake = "0.6.0"
+qrcode = { version = "0.14", default-features = false }
