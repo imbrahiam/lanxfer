@@ -83,6 +83,16 @@ pub enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Host a browser page so phones/devices without lanxfer can upload and
+    /// download files (works offline, e.g. laptop as wifi hotspot).
+    #[command(visible_alias = "local")]
+    Web {
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        bind: String,
+        /// Directory to share and receive uploads into.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
     /// Check for updates or install the latest GitHub release.
     Update {
         /// Only check; do not replace the current executable.

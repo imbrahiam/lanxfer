@@ -32,6 +32,8 @@ struct PeerCtx {
     tokens: server::PullTokens,
     /// Live counters for everything our server is currently receiving.
     recv_progress: Arc<Progress>,
+    /// Live counters for pull requests our server is currently sending.
+    send_progress: Arc<Progress>,
 }
 
 pub struct TransferRecord {
@@ -196,9 +198,11 @@ pub async fn run_peer_mode(
         local_port: port,
         tokens: server::PullTokens::default(),
         recv_progress: Arc::new(Progress::default()),
+        send_progress: Arc::new(Progress::default()),
     };
     let tokens = Arc::clone(&ctx.tokens);
     let recv_progress = Arc::clone(&ctx.recv_progress);
+    let send_progress = Arc::clone(&ctx.send_progress);
     tokio::spawn(async move {
         let _ = server::run_server(
             listener,
@@ -209,6 +213,7 @@ pub async fn run_peer_mode(
             Some(server_tx),
             tokens,
             recv_progress,
+            send_progress,
         )
         .await;
     });
@@ -232,6 +237,7 @@ pub async fn run_interactive(discovery_port: u16, timeout_ms: u64, port: u16) ->
         local_port: port,
         tokens: server::PullTokens::default(),
         recv_progress: Arc::new(Progress::default()),
+        send_progress: Arc::new(Progress::default()),
     };
     peer_loop(
         &mut screen,
@@ -299,7 +305,7 @@ async fn peer_loop(
 ) -> Result<()> {
     let mut codes: HashMap<String, String> = HashMap::new();
     let mut transfers: Vec<TransferRecord> = Vec::new();
-    let local_ips = local_ipv4s();
+    let local_ips = util::local_ipv4s();
     let my_host = util::host_name();
 
     let mut hosts: Vec<discovery::DiscoveredHost> = Vec::new();
@@ -313,6 +319,7 @@ async fn peer_loop(
         let mut scan_task: Option<tokio::task::JoinHandle<Vec<discovery::DiscoveredHost>>> = None;
         let mut last_scan_end: Option<Instant> = None;
         let mut recv_gauge = SpeedGauge::default();
+        let mut send_gauge = SpeedGauge::default();
         let mut recv_line: Option<String> = None;
 
         let pick: Pick = loop {
@@ -357,8 +364,8 @@ async fn peer_loop(
                 dirty = true;
             }
 
-            // Live footer while our server is receiving a transfer.
-            let status = recv_status_line(&ctx.recv_progress, &mut recv_gauge);
+            // Live footer while our server is receiving or sending.
+            let status = server_activity_line(&ctx, &mut recv_gauge, &mut send_gauge);
             if status != recv_line {
                 recv_line = status;
                 dirty = true;
@@ -445,8 +452,13 @@ async fn peer_loop(
     }
 }
 
-/// Footer line while our own server is receiving files, else None.
-fn recv_status_line(progress: &Progress, gauge: &mut SpeedGauge) -> Option<String> {
+/// One-line live summary while `progress` is active, else None.
+/// `verb` reads like "⇣ receiving …" / "⇡ sending …".
+pub fn transfer_status_line(
+    progress: &Progress,
+    gauge: &mut SpeedGauge,
+    verb: &str,
+) -> Option<String> {
     if !progress.is_active() {
         return None;
     }
@@ -454,7 +466,7 @@ fn recv_status_line(progress: &Progress, gauge: &mut SpeedGauge) -> Option<Strin
     let speed = gauge.update(s.done_bytes);
     let file_rate = gauge.update_files(s.done_files);
     Some(format!(
-        "⇣ receiving {}/{} files · {} of {} · {}/s · overall ETA {}",
+        "{verb} {}/{} files · {} of {} · {}/s · overall ETA {}",
         s.done_files,
         s.total_files,
         util::format_size(s.done_bytes),
@@ -467,6 +479,20 @@ fn recv_status_line(progress: &Progress, gauge: &mut SpeedGauge) -> Option<Strin
             file_rate,
         ),
     ))
+}
+
+/// Combined receive+send footer for our local server's background activity.
+fn server_activity_line(
+    ctx: &PeerCtx,
+    recv_gauge: &mut SpeedGauge,
+    send_gauge: &mut SpeedGauge,
+) -> Option<String> {
+    let recv = transfer_status_line(&ctx.recv_progress, recv_gauge, "⇣ receiving");
+    let send = transfer_status_line(&ctx.send_progress, send_gauge, "⇡ sending");
+    match (recv, send) {
+        (Some(r), Some(s)) => Some(format!("{r}    {s}")),
+        (recv, send) => recv.or(send),
+    }
 }
 
 /// Full-card live progress for an in-flight transfer, one line per
@@ -648,6 +674,7 @@ async fn peer_ui(
         let mut selected = 0usize;
         let mut dirty = true;
         let mut recv_gauge = SpeedGauge::default();
+        let mut send_gauge = SpeedGauge::default();
         let mut recv_line: Option<String> = None;
         let sel: usize = loop {
             if conn.is_closed() {
@@ -661,8 +688,8 @@ async fn peer_ui(
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 return Ok(PeerExit::Closed);
             }
-            // Live footer while our server is receiving a transfer.
-            let status = recv_status_line(&ctx.recv_progress, &mut recv_gauge);
+            // Live footer while our server is receiving or sending.
+            let status = server_activity_line(ctx, &mut recv_gauge, &mut send_gauge);
             if status != recv_line {
                 recv_line = status;
                 dirty = true;
@@ -804,18 +831,6 @@ fn ensure_code(
     let code = code.trim().to_uppercase();
     codes.insert(ip.to_string(), code.clone());
     Ok(Some(Some(code)))
-}
-
-fn local_ipv4s() -> Vec<String> {
-    let mut ips = Vec::new();
-    if let Ok(ifaces) = if_addrs::get_if_addrs() {
-        for iface in ifaces {
-            if let if_addrs::IfAddr::V4(v4) = iface.addr {
-                ips.push(v4.ip.to_string());
-            }
-        }
-    }
-    ips
 }
 
 async fn list_drives(screen: &mut crate::picker::StatusScreen, ip: &str, port: u16) -> Result<()> {

@@ -40,6 +40,18 @@ pub fn local_device_info() -> DeviceInfo {
     }
 }
 
+pub fn local_ipv4s() -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                ips.push(v4.ip.to_string());
+            }
+        }
+    }
+    ips
+}
+
 pub fn generate_pairing_code() -> String {
     let raw = uuid::Uuid::new_v4().simple().to_string();
     raw[..6].to_uppercase()

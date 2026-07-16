@@ -118,6 +118,20 @@ If you want a machine to only receive (e.g., a server with no interactive shell)
 lanxfer serve
 ```
 
+### Browser transfer (phones, offline hotspots)
+
+For devices without lanxfer — e.g. your laptop acting as a wifi hotspot and a
+phone that needs to drop off or grab files:
+
+```bash
+lanxfer web              # shares the current directory
+lanxfer web --dir ~/Downloads
+```
+
+It prints the URL and a QR code; the phone opens it in any browser to
+browse folders, download files, and upload with a progress bar. No internet
+required — only a shared network. `lanxfer local` is an alias.
+
 ### Direct commands
 
 ```bash
@@ -139,6 +153,7 @@ lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3 --overwrite --jo
 | `lanxfer --open` | Peer mode without pairing codes (trusted networks) |
 | `lanxfer interactive` | Sender-only interactive session |
 | `lanxfer serve` | Headless receiver |
+| `lanxfer web` (alias `local`) | Browser page for devices without lanxfer (QR code, upload/download) |
 | `lanxfer discover` | Find receivers on network |
 | `lanxfer connect` | Connect to a receiver (discovery or `--target IP`) |
 | `lanxfer destinations <ip>` | List drives on a receiver |
