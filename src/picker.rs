@@ -292,6 +292,11 @@ pub(crate) enum MultiChoice {
 /// Drain pending input during a busy screen (progress cards): Ctrl+C still
 /// quits, everything else is discarded.
 pub(crate) fn pump_quit_only() -> Result<()> {
+    // No TUI (piped/headless) → no raw mode, SIGINT works normally and
+    // crossterm cannot even open an input reader.
+    if !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
     while event::poll(std::time::Duration::ZERO)? {
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -475,8 +480,11 @@ fn draw_transfer(
 ) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    let width = area.width.saturating_sub(4).clamp(1, 160);
-    let height = area.height.saturating_sub(2).clamp(1, 44);
+    // Size the card like the other status cards — a compact centered panel
+    // that grows with the number of in-flight files, never the whole screen.
+    let width = area.width.min(82);
+    let units_rows = (units.len() as u16 + 1).max(3);
+    let height = (17 + units_rows).min(34);
     let card = centered(area, width, height);
     frame.render_widget(Clear, card);
     frame.render_widget(
@@ -497,8 +505,8 @@ fn draw_transfer(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
-            Constraint::Length(4),
-            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(2),
             Constraint::Min(3),

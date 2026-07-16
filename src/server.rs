@@ -75,6 +75,7 @@ pub async fn run_server(
     ui_tx: Option<mpsc::UnboundedSender<super::interactive::ServerEvent>>,
     pull_tokens: PullTokens,
     recv_progress: Arc<crate::progress::Progress>,
+    send_progress: Arc<crate::progress::Progress>,
 ) -> Result<()> {
     let local = listener.local_addr()?;
     let device = util::local_device_info();
@@ -101,6 +102,7 @@ pub async fn run_server(
         let ui_tx = ui_tx.clone();
         let pull_tokens = Arc::clone(&pull_tokens);
         let recv_progress = Arc::clone(&recv_progress);
+        let send_progress = Arc::clone(&send_progress);
         tokio::spawn(async move {
             if let Err(err) = handle_client(
                 socket,
@@ -111,6 +113,7 @@ pub async fn run_server(
                 ui_tx,
                 pull_tokens,
                 recv_progress,
+                send_progress,
             )
             .await
             {
@@ -137,6 +140,7 @@ async fn handle_client(
     ui_tx: Option<mpsc::UnboundedSender<super::interactive::ServerEvent>>,
     pull_tokens: PullTokens,
     recv_progress: Arc<crate::progress::Progress>,
+    send_progress: Arc<crate::progress::Progress>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     tune_socket(&stream);
@@ -320,6 +324,7 @@ async fn handle_client(
                     }
                 };
                 send_control(&mut stream, &ControlMessage::JoinAck).await?;
+                let send_progress = Arc::clone(&send_progress);
                 tokio::spawn(async move {
                     if let Err(err) = handle_push_request(
                         stream,
@@ -329,6 +334,7 @@ async fn handle_client(
                         &dest_local_path,
                         return_auth_code.as_deref(),
                         overwrite,
+                        send_progress,
                     )
                     .await
                     {
@@ -857,6 +863,7 @@ async fn handle_push_request(
     dest_local_path: &str,
     return_auth_code: Option<&str>,
     overwrite: bool,
+    send_progress: Arc<crate::progress::Progress>,
 ) -> Result<()> {
     // Build the local source paths from the remote file specs.
     let sources: Vec<PathBuf> = requested_files
@@ -909,7 +916,7 @@ async fn handle_push_request(
             dry_run: false,
             jobs: None,
             show_progress: false,
-            progress: None,
+            progress: Some(send_progress),
         },
     )
     .await;
@@ -964,6 +971,7 @@ mod tests {
             None,
             PullTokens::default(),
             Arc::default(),
+            Arc::default(),
         ));
 
         // Peer B (the requester): auth required, one-time token registered.
@@ -979,6 +987,7 @@ mod tests {
             true,
             None,
             Arc::clone(&tokens),
+            Arc::default(),
             Arc::default(),
         ));
 

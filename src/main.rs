@@ -10,6 +10,7 @@ mod storage;
 mod ui;
 mod updater;
 mod util;
+mod web;
 
 use anyhow::Result;
 use clap::Parser;
@@ -119,21 +120,24 @@ async fn run(cli: Cli) -> Result<()> {
                     "anyone on this network can send files".into(),
                 ));
             }
+            let tone = if open {
+                picker::Tone::Warning
+            } else {
+                picker::Tone::Info
+            };
             screen.render(
                 "Receiver",
                 "Waiting for senders…",
-                if open {
-                    picker::Tone::Warning
-                } else {
-                    picker::Tone::Info
-                },
+                tone,
                 &details,
                 "Ctrl-C  stop",
             )?;
             let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
                 anyhow::anyhow!("cannot listen on {bind}: {e} (another lanxfer running?)")
             })?;
-            server::run_server(
+            let recv_progress = std::sync::Arc::new(progress::Progress::default());
+            let send_progress = std::sync::Arc::new(progress::Progress::default());
+            let server = tokio::spawn(server::run_server(
                 listener,
                 discovery_port,
                 code,
@@ -141,9 +145,41 @@ async fn run(cli: Cli) -> Result<()> {
                 !open,
                 None,
                 server::PullTokens::default(),
-                std::sync::Arc::new(progress::Progress::default()),
-            )
-            .await?;
+                std::sync::Arc::clone(&recv_progress),
+                std::sync::Arc::clone(&send_progress),
+            ));
+            // Status ticker: repaint the card with live transfer lines and
+            // keep Ctrl-C working (raw mode swallows SIGINT).
+            let mut recv_gauge = progress::SpeedGauge::default();
+            let mut send_gauge = progress::SpeedGauge::default();
+            let mut last: Option<Vec<(String, String)>> = None;
+            loop {
+                if server.is_finished() {
+                    return server.await?;
+                }
+                picker::pump_quit_only()?;
+                let mut live = details.clone();
+                let recv =
+                    interactive::transfer_status_line(&recv_progress, &mut recv_gauge, "receiving");
+                let send =
+                    interactive::transfer_status_line(&send_progress, &mut send_gauge, "sending");
+                if let Some(line) = &recv {
+                    live.push(("⇣ activity".into(), line.clone()));
+                }
+                if let Some(line) = &send {
+                    live.push(("⇡ activity".into(), line.clone()));
+                }
+                if last.as_ref() != Some(&live) {
+                    let message = if recv.is_some() || send.is_some() {
+                        "Transfer in progress…"
+                    } else {
+                        "Waiting for senders…"
+                    };
+                    screen.render("Receiver", message, tone, &live, "Ctrl-C  stop")?;
+                    last = Some(live);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
         }
         Some(Command::Discover {
             discovery_port,
@@ -185,6 +221,9 @@ async fn run(cli: Cli) -> Result<()> {
                 !no_progress,
             )
             .await?;
+        }
+        Some(Command::Web { bind, dir }) => {
+            web::run(&bind, dir).await?;
         }
         Some(Command::Update { check, yes }) => {
             updater::run(check, yes)?;
