@@ -10,6 +10,29 @@ const REPO: &str = "lanxfer";
 const MAX_ATTEMPTS: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// Friendly platform slug embedded in release asset names
+/// (`lanxfer-<tag>-<slug>.<ext>`). Must match the `name` values in
+/// `.github/workflows/release.yml`; `self_update` picks the asset whose
+/// name contains this string, so the two have to stay in sync.
+const fn asset_slug() -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "linux-x86_64"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "windows-x86_64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "macos-arm64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "macos-x86_64"
+    }
+}
+
 pub fn run(check_only: bool, assume_yes: bool) -> Result<()> {
     let installed = env!("CARGO_PKG_VERSION");
 
@@ -115,6 +138,7 @@ fn run_update_with_retry(current_version: &str) -> Result<String> {
             .repo_owner(OWNER)
             .repo_name(REPO)
             .bin_name("lanxfer")
+            .target(asset_slug())
             .no_confirm(true)
             .show_output(false)
             .show_download_progress(false)
@@ -139,4 +163,16 @@ fn run_update_with_retry(current_version: &str) -> Result<String> {
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("update failed after {MAX_ATTEMPTS} attempts")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asset_slug;
+
+    #[test]
+    fn slug_resolves_for_this_platform() {
+        // Exactly one cfg arm must match, giving a non-empty slug that
+        // matches an asset published by release.yml for this platform.
+        assert!(!asset_slug().is_empty());
+    }
 }

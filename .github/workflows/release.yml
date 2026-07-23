@@ -9,22 +9,26 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
             archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            name: windows-x86_64
             archive: zip
           - os: macos-14
             target: aarch64-apple-darwin
+            name: macos-arm64
             archive: tar.gz
           - os: macos-14
             target: x86_64-apple-darwin
+            name: macos-x86_64
             archive: tar.gz
 
     runs-on: ${{ matrix.os }}
@@ -37,15 +41,15 @@ jobs:
       - name: Package Unix binary
         if: matrix.archive == 'tar.gz'
         shell: bash
-        run: tar -C target/${{ matrix.target }}/release -czf lanxfer-${{ matrix.target }}.tar.gz lanxfer
+        run: tar -C target/${{ matrix.target }}/release -czf lanxfer-${{ github.ref_name }}-${{ matrix.name }}.tar.gz lanxfer
       - name: Package Windows binary
         if: matrix.archive == 'zip'
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/lanxfer.exe -DestinationPath lanxfer-${{ matrix.target }}.zip
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/lanxfer.exe -DestinationPath lanxfer-${{ github.ref_name }}-${{ matrix.name }}.zip
       - uses: actions/upload-artifact@v7
         with:
-          name: lanxfer-${{ matrix.target }}
-          path: lanxfer-${{ matrix.target }}.${{ matrix.archive }}
+          name: lanxfer-${{ matrix.name }}
+          path: lanxfer-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
 
   publish:
     needs: build
