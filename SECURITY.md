@@ -24,6 +24,9 @@ fix and coordinated release before publishing details.
 - Treat the `lanxfer web` private URL like a temporary password. Stop the
   process when sharing is complete.
 - Keep both peers on the same current protocol version.
+- The hosted WebRTC app uses the public PeerJS service for signaling and may
+  use its TURN relays. File contents remain encrypted in transit but relay
+  operators can observe connection metadata. Keep room codes private.
 
 The built-in browser share confines access beneath the preopened share
 directory, rejects traversal through symlinks, limits concurrent connections

@@ -19,9 +19,28 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://lanxfer.vercel.app"),
   title: "LANXFER — direct file transfer",
   description:
     "Browser-to-browser file transfer encrypted in transit with WebRTC. No accounts or server storage.",
+  applicationName: "LANXFER",
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    type: "website",
+    url: "/",
+    siteName: "LANXFER",
+    title: "LANXFER — direct file transfer",
+    description:
+      "Send files between browsers with WebRTC encryption and no server storage.",
+  },
+  twitter: {
+    card: "summary",
+    title: "LANXFER — direct file transfer",
+    description:
+      "Send files between browsers with WebRTC encryption and no server storage.",
+  },
 };
 
 export default function RootLayout({

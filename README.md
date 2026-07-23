@@ -291,10 +291,12 @@ connections; everything else streams whole, back-to-back.
 
 `web/` contains a Next.js app (RetroUI) for browser↔browser transfers over
 WebRTC. Transport is DTLS-encrypted and the app uses no file-storage backend;
-the public PeerJS broker is used for connection setup. Room codes are
-8 characters, incoming metadata and byte counts are validated, writes are
-serialized, and large fallback downloads are bounded. Deploy with `vercel`
-from `web/`, or run locally with `bun run dev`.
+the public PeerJS service is used for signaling and may provide an encrypted
+TURN relay when a direct route is unavailable. Room codes are 8 characters,
+incoming metadata and byte counts are validated, writes are serialized,
+received files are acknowledged before senders report success, existing files
+are not overwritten, and in-memory fallback downloads are bounded. Deploy with
+`vercel` from `web/`, or run locally with `bun run dev`.
 
 ## License
 
