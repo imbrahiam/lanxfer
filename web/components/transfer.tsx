@@ -12,6 +12,7 @@ import {
   CODE_LENGTH,
   MAX_BUFFERED_FILE_SIZE,
   MAX_FILE_SIZE,
+  buildInviteUrl,
   cleanRoomCode,
   fmtSize,
   genCode,
@@ -223,7 +224,7 @@ export function Transfer() {
     const receiptWaiters = receiptWaitersRef.current;
     const downloadUrls = downloadUrlsRef.current;
     const invitedCode = cleanRoomCode(
-      new URLSearchParams(window.location.search).get("room") ?? "",
+      new URLSearchParams(window.location.hash.slice(1)).get("room") ?? "",
     );
     if (isValidRoomCode(invitedCode)) {
       queueMicrotask(() => {
@@ -730,21 +731,17 @@ export function Transfer() {
   }, [roomCode]);
 
   const shareRoom = React.useCallback(async () => {
-    const inviteUrl = new URL(window.location.href);
-    inviteUrl.search = "";
-    inviteUrl.hash = "";
-    inviteUrl.searchParams.set("room", roomCode);
     const shareData = {
       title: "Join my LANXFER room",
       text: `Join my LANXFER room with code ${roomCode}`,
-      url: inviteUrl.toString(),
+      url: buildInviteUrl(window.location.href, roomCode),
     };
     try {
       if (navigator.share) {
         await navigator.share(shareData);
         setStatus("Room invite shared.");
       } else {
-        await navigator.clipboard.writeText(inviteUrl.toString());
+        await navigator.clipboard.writeText(shareData.url);
         setStatus("Invite link copied.");
       }
     } catch (error) {

@@ -60,6 +60,13 @@ export function numberedFileName(name: string, index: number) {
   return `${name.slice(0, dot)} (${index})${name.slice(dot)}`;
 }
 
+export function buildInviteUrl(currentUrl: string, roomCode: string) {
+  const inviteUrl = new URL(currentUrl);
+  inviteUrl.search = "";
+  inviteUrl.hash = new URLSearchParams({ room: roomCode }).toString();
+  return inviteUrl.toString();
+}
+
 export function fmtSize(bytes: number) {
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;

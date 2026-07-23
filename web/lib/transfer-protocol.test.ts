@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   CODE_LENGTH,
+  buildInviteUrl,
   cleanRoomCode,
   fmtSize,
   isValidRoomCode,
@@ -19,6 +20,14 @@ describe("room codes", () => {
     expect(isValidRoomCode("ABCD1234")).toBe(false);
     expect(isValidRoomCode("ABCD234")).toBe(false);
     expect(CODE_LENGTH).toBe(8);
+  });
+
+  test("keeps invite codes out of server-visible query strings", () => {
+    const invite = new URL(
+      buildInviteUrl("https://lanxfer.vercel.app/?old=value", "ABCD2345"),
+    );
+    expect(invite.search).toBe("");
+    expect(invite.hash).toBe("#room=ABCD2345");
   });
 });
 
