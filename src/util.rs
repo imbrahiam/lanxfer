@@ -53,8 +53,40 @@ pub fn local_ipv4s() -> Vec<String> {
 }
 
 pub fn generate_pairing_code() -> String {
-    let raw = uuid::Uuid::new_v4().simple().to_string();
-    raw[..6].to_uppercase()
+    const CHARS: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut value = u128::from_le_bytes(*uuid::Uuid::new_v4().as_bytes());
+    (0..8)
+        .map(|_| {
+            let c = CHARS[(value & 31) as usize] as char;
+            value >>= 5;
+            c
+        })
+        .collect()
+}
+
+pub fn auth_challenge() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Challenge-response proof used in place of sending pairing secrets over
+/// the network. Each connection receives a fresh server challenge.
+pub fn auth_proof(secret: &str, challenge: &str) -> String {
+    let normalized = secret.trim().to_uppercase();
+    let key = blake3::derive_key("lanxfer pairing proof v1", normalized.as_bytes());
+    let proof = blake3::keyed_hash(&key, challenge.as_bytes());
+    format!("v1:{}", proof.to_hex())
+}
+
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut different = left.len() ^ right.len();
+    let max = left.len().max(right.len());
+    for i in 0..max {
+        different |=
+            (left.get(i).copied().unwrap_or(0) ^ right.get(i).copied().unwrap_or(0)) as usize;
+    }
+    different == 0
 }
 
 pub fn system_time_secs(time: SystemTime) -> i64 {
@@ -217,5 +249,19 @@ mod tests {
         assert!(is_striped(STRIPE_THRESHOLD));
         assert_eq!(stripe_count(STRIPE_THRESHOLD), 4);
         assert_eq!(stripe_range(STRIPE_THRESHOLD + 5, 4), (4 * STRIPE_SIZE, 5));
+    }
+
+    #[test]
+    fn pairing_codes_and_proofs_are_strong_and_challenge_bound() {
+        let code = generate_pairing_code();
+        assert_eq!(code.len(), 8);
+        assert!(code.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        let first = auth_proof(&code, "challenge-a");
+        assert!(constant_time_eq(
+            &first,
+            &auth_proof(&code.to_lowercase(), "challenge-a")
+        ));
+        assert!(!constant_time_eq(&first, &auth_proof(&code, "challenge-b")));
     }
 }

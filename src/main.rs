@@ -95,7 +95,7 @@ async fn run(cli: Cli) -> Result<()> {
             pairing_code,
             open,
         }) => {
-            let code = server::ensure_pairing_code(pairing_code);
+            let code = server::ensure_pairing_code(pairing_code)?;
             let device = util::local_device_info();
             let mut screen = picker::StatusScreen::new()?;
             let mut details = vec![
@@ -189,14 +189,15 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Connect {
             target,
+            code,
             discovery_port,
             timeout_ms,
             port,
         }) => {
-            client::connect_interactive(target, discovery_port, timeout_ms, port).await?;
+            client::connect_interactive(target, code, discovery_port, timeout_ms, port).await?;
         }
-        Some(Command::Destinations { target, port }) => {
-            client::print_destinations(&target, port).await?;
+        Some(Command::Destinations { target, port, code }) => {
+            client::print_destinations(&target, port, code.as_deref()).await?;
         }
         Some(Command::Send {
             target,
@@ -222,8 +223,14 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
         }
-        Some(Command::Web { bind, dir }) => {
-            web::run(&bind, dir).await?;
+        Some(Command::Web {
+            bind,
+            dir,
+            open,
+            max_upload_bytes,
+            max_connections,
+        }) => {
+            web::run(&bind, dir, open, max_upload_bytes, max_connections).await?;
         }
         Some(Command::Update { check, yes }) => {
             updater::run(check, yes)?;

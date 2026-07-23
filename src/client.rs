@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,8 @@ use crate::protocol::{
 };
 use crate::ui;
 use crate::util;
+
+const MAX_PARALLEL_JOBS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DirectoryEntry {
@@ -66,7 +68,7 @@ struct Unit {
     stripe: Option<u32>,
 }
 
-/// v3 session engine: one manifest round-trip, then persistent data
+/// v5 session engine: one manifest round-trip, then persistent data
 /// connections streaming units back-to-back. Large files are striped across
 /// connections; BLAKE3 subtree CVs are merged for whole-file verification.
 pub async fn send_session(
@@ -109,12 +111,13 @@ pub async fn send_session(
         .collect();
 
     // Control connection: manifest -> plan.
-    let (mut control, _device, _) = connect_and_handshake(target, port).await?;
+    let (mut control, _device, _, auth_challenge) = connect_and_handshake(target, port).await?;
+    let auth_proof = auth_code.map(|code| util::auth_proof(code, &auth_challenge));
     send_control(
         &mut control,
         &ControlMessage::BeginSession {
             destination_path: destination.to_string(),
-            auth_code: auth_code.map(ToString::to_string),
+            auth_code: auth_proof,
             overwrite: opts.overwrite,
             dry_run: opts.dry_run,
             files: specs,
@@ -228,7 +231,8 @@ pub async fn send_session(
     let worker_count = opts
         .jobs
         .unwrap_or_else(|| default_jobs(queue.len()))
-        .max(1);
+        .clamp(1, MAX_PARALLEL_JOBS)
+        .min(queue.len().max(1));
     log::info!(
         "send session to {target}: {file_count} files, {} bytes, {worker_count} connections",
         total_bytes_to_send
@@ -263,6 +267,12 @@ pub async fn send_session(
     let stripe_cvs: Arc<Mutex<HashMap<u32, HashMap<u32, util::StripeCv>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let sent_bytes = Arc::new(AtomicU64::new(0));
+    let expected_ids: HashSet<u32> = actions
+        .iter()
+        .filter_map(|(id, action)| {
+            matches!(action, PlanAction::Send | PlanAction::Resume { .. }).then_some(*id)
+        })
+        .collect();
 
     // Control reader collects FileDone results while workers stream.
     let done_overall = overall.clone();
@@ -277,6 +287,13 @@ pub async fn send_session(
                     ok,
                     error,
                 }) => {
+                    if !expected_ids.contains(&id) {
+                        return (
+                            control,
+                            dones,
+                            Some(format!("receiver reported unexpected file id {id}")),
+                        );
+                    }
                     dones.insert(id, (hash, ok, error));
                     if let Some(p) = &done_progress {
                         p.file_done();
@@ -286,13 +303,13 @@ pub async fn send_session(
                     }
                 }
                 Ok(ControlMessage::Error { message }) => {
-                    return (dones, Some(message));
+                    return (control, dones, Some(message));
                 }
                 Ok(_) => continue,
-                Err(err) => return (dones, Some(err.to_string())),
+                Err(err) => return (control, dones, Some(err.to_string())),
             }
         }
-        (dones, None)
+        (control, dones, None)
     });
 
     let mut workers = JoinSet::new();
@@ -338,14 +355,26 @@ pub async fn send_session(
 
     // Wait for the server's completion reports. If a worker died, some
     // FileDones will never come — bounded wait, then report.
-    let (dones, control_err) = if worker_errors.is_empty() {
-        control_task
+    let mut control_task = control_task;
+    let (mut control, dones, control_err) = if worker_errors.is_empty() {
+        let (control, dones, err) = control_task
             .await
-            .map_err(|e| anyhow!("control reader: {e}"))?
+            .map_err(|e| anyhow!("control reader: {e}"))?;
+        (Some(control), dones, err)
     } else {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), control_task).await {
-            Ok(joined) => joined.map_err(|e| anyhow!("control reader: {e}"))?,
-            Err(_) => (HashMap::new(), Some("timed out waiting for results".into())),
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut control_task).await {
+            Ok(joined) => {
+                let (control, dones, err) = joined.map_err(|e| anyhow!("control reader: {e}"))?;
+                (Some(control), dones, err)
+            }
+            Err(_) => {
+                control_task.abort();
+                (
+                    None,
+                    HashMap::new(),
+                    Some("timed out waiting for results".into()),
+                )
+            }
         }
     };
 
@@ -359,8 +388,8 @@ pub async fn send_session(
     }
 
     // Reconcile: server hash must equal our locally computed hash.
-    let client_hashes = client_hashes.lock().unwrap();
-    let stripe_cvs = stripe_cvs.lock().unwrap();
+    let client_hashes = client_hashes.lock().unwrap().clone();
+    let stripe_cvs = stripe_cvs.lock().unwrap().clone();
     for (id, file) in files.iter().enumerate() {
         let id = id as u32;
         let needs_done = matches!(
@@ -382,7 +411,42 @@ pub async fn send_session(
         };
         match (dones.get(&id), local_hash) {
             (Some((server_hash, true, _)), Some(local)) if *server_hash == local => {
-                summary.transferred += 1;
+                let Some(control) = control.as_mut() else {
+                    summary.errors.push(format!(
+                        "{}: control connection unavailable",
+                        file.relative_path
+                    ));
+                    continue;
+                };
+                send_control(
+                    control,
+                    &ControlMessage::CommitFile {
+                        id,
+                        expected_hash: local,
+                    },
+                )
+                .await?;
+                match read_control_timeout(control, std::time::Duration::from_secs(30)).await? {
+                    ControlMessage::CommitAck {
+                        id: acked,
+                        ok: true,
+                        ..
+                    } if acked == id => summary.transferred += 1,
+                    ControlMessage::CommitAck {
+                        id: acked, error, ..
+                    } if acked == id => summary.errors.push(format!(
+                        "{}: commit failed: {}",
+                        file.relative_path,
+                        error.unwrap_or_else(|| "receiver rejected commit".into())
+                    )),
+                    ControlMessage::Error { message } => summary
+                        .errors
+                        .push(format!("{}: commit failed: {message}", file.relative_path)),
+                    other => summary.errors.push(format!(
+                        "{}: unexpected commit response: {other:?}",
+                        file.relative_path
+                    )),
+                }
             }
             (Some((server_hash, true, _)), Some(local)) => summary.errors.push(format!(
                 "{}: hash mismatch (local {local}, remote {server_hash})",
@@ -429,14 +493,15 @@ pub async fn pull_session(
         remote_files.len()
     );
 
-    let (mut control, _device, _) = connect_and_handshake(target, port).await?;
+    let (mut control, _device, _, auth_challenge) = connect_and_handshake(target, port).await?;
+    let auth_proof = auth_code.map(|code| util::auth_proof(code, &auth_challenge));
     send_control(
         &mut control,
         &ControlMessage::PushRequest {
             files: remote_files.to_vec(),
             dest_local_path: dest_local_path.to_string(),
             requester_port,
-            auth_code: auth_code.map(ToString::to_string),
+            auth_code: auth_proof,
             overwrite,
             return_auth_code: return_auth_code.map(ToString::to_string),
         },
@@ -504,7 +569,7 @@ async fn run_worker(
         return Ok(());
     }
 
-    let (mut stream, _, _) = connect_and_handshake(target, port).await?;
+    let (mut stream, _, _, _) = connect_and_handshake(target, port).await?;
     send_control(
         &mut stream,
         &ControlMessage::JoinSession {
@@ -710,12 +775,13 @@ pub async fn discover(discovery_port: u16, timeout_ms: u64) -> Result<()> {
 
 pub async fn connect_interactive(
     direct_target: Option<String>,
+    auth_code: Option<String>,
     discovery_port: u16,
     timeout_ms: u64,
     port: u16,
 ) -> Result<()> {
     if let Some(target) = direct_target {
-        connect_and_list_destinations(&target, port).await?;
+        connect_and_list_destinations(&target, port, auth_code.as_deref()).await?;
         return Ok(());
     }
 
@@ -733,7 +799,8 @@ pub async fn connect_interactive(
             "found single receiver {}",
             ui::bold(&host.reply.host)
         ));
-        connect_and_list_destinations(&host.ip, host.reply.control_port).await?;
+        connect_and_list_destinations(&host.ip, host.reply.control_port, auth_code.as_deref())
+            .await?;
         return Ok(());
     }
 
@@ -758,7 +825,7 @@ pub async fn connect_interactive(
         );
     }
 
-    let (stream, device, _) = loop {
+    let (stream, device, _, _) = loop {
         print!(
             "\n  {} select receiver (1-{}) or 0 to quit: ",
             console::style("▶").yellow().bold(),
@@ -792,8 +859,13 @@ pub async fn connect_interactive(
     Ok(())
 }
 
-async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
-    let (mut stream, device, _) = connect_and_handshake(target, port).await?;
+async fn connect_and_list_destinations(
+    target: &str,
+    port: u16,
+    auth_code: Option<&str>,
+) -> Result<()> {
+    let (mut stream, device, auth_required, auth_challenge) =
+        connect_and_handshake(target, port).await?;
     ui::success(&format!(
         "connected to {} ({} {}, protocol {})",
         ui::bold(&device.host_name),
@@ -801,7 +873,16 @@ async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
         device.arch,
         device.protocol_version
     ));
-    send_control(&mut stream, &ControlMessage::ListDestinations).await?;
+    if auth_required && auth_code.is_none() {
+        bail!("pairing code required; pass --code <CODE>");
+    }
+    send_control(
+        &mut stream,
+        &ControlMessage::ListDestinations {
+            auth_code: auth_code.map(|code| util::auth_proof(code, &auth_challenge)),
+        },
+    )
+    .await?;
     let reply = read_control(&mut stream).await?;
 
     match reply {
@@ -812,8 +893,8 @@ async fn connect_and_list_destinations(target: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-pub async fn print_destinations(target: &str, port: u16) -> Result<()> {
-    connect_and_list_destinations(target, port).await
+pub async fn print_destinations(target: &str, port: u16, auth_code: Option<&str>) -> Result<()> {
+    connect_and_list_destinations(target, port, auth_code).await
 }
 
 fn print_destination_table(items: &[crate::protocol::DestinationInfo]) {
@@ -899,7 +980,7 @@ async fn connect_with_timeout(addr: &str) -> Result<TcpStream> {
 pub(crate) async fn connect_and_handshake(
     target: &str,
     port: u16,
-) -> Result<(TcpStream, crate::protocol::DeviceInfo, bool)> {
+) -> Result<(TcpStream, crate::protocol::DeviceInfo, bool, String)> {
     let addr = format!("{target}:{port}");
     let mut stream = connect_with_timeout(&addr).await?;
     stream.set_nodelay(true)?;
@@ -920,7 +1001,8 @@ pub(crate) async fn connect_and_handshake(
             version,
             server,
             auth_required,
-        } if version == PROTOCOL_VERSION => Ok((stream, server, auth_required)),
+            auth_challenge,
+        } if version == PROTOCOL_VERSION => Ok((stream, server, auth_required, auth_challenge)),
         ControlMessage::HelloAck { version, .. } => {
             bail!("server protocol version mismatch: {version}")
         }

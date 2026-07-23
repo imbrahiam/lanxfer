@@ -11,7 +11,7 @@ Fast, resumable LAN file transfer CLI with zero-config peer mode. Built for movi
 - **BLAKE3 verification** - Every file verified with BLAKE3 hash after transfer
 - **Parallel workers** - Multiple files transfer simultaneously for maximum throughput
 - **Progress bars** - Real-time per-file and overall progress with speed and ETA
-- **Pairing code auth** - Simple 6-character code protects against unauthorized writes
+- **Pairing code auth** - An 8-character code is proven with a fresh per-connection challenge and never sent directly
 - **Cross-platform** - macOS, Linux, Windows
 - **Sleep prevention** - Keeps the system awake while lanxfer is running so long transfers are not interrupted (the display may still turn off)
 
@@ -128,9 +128,12 @@ lanxfer web              # shares the current directory
 lanxfer web --dir ~/Downloads
 ```
 
-It prints the URL and a QR code; the phone opens it in any browser to
-browse folders, download files, and upload with a progress bar. No internet
-required — only a shared network. `lanxfer local` is an alias.
+It prints a private, unguessable URL and a QR code; the phone opens it in any
+browser to browse folders, download files, and upload with a progress bar. No
+internet is required — only a shared network. Filesystem access remains
+capability-confined to the shared folder, including when it contains symlinks.
+`lanxfer local` is an alias. Use `lanxfer web --open` only on a trusted network
+when you intentionally want a link-free public share.
 
 ### Direct commands
 
@@ -139,10 +142,10 @@ required — only a shared network. `lanxfer local` is an alias.
 lanxfer discover
 
 # Send files directly
-lanxfer send 10.0.0.69 ./myfile.txt /home/user/dest --code A1B2C3
+lanxfer send 10.0.0.69 ./myfile.txt /home/user/dest --code A1B2C3D4
 
 # Send a folder with overwrite
-lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3 --overwrite --jobs 6
+lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3D4 --overwrite --jobs 6
 ```
 
 ## Commands
@@ -163,7 +166,7 @@ lanxfer send 10.0.0.69 ./myfolder /home/user/dest --code A1B2C3 --overwrite --jo
 
 ## Performance
 
-Protocol v3 is built to hit the hardware limit, not the protocol limit:
+Protocol v5 is built to hit the hardware limit, not the protocol limit:
 
 - **Manifest sessions** — the whole file tree is negotiated in one round-trip.
   Files then stream back-to-back over persistent connections with zero
@@ -199,6 +202,20 @@ parallel streams keep the link full where a single TCP flow stalls.
 |------|----------|-----------|---------|
 | 44818 | TCP | Sender -> Receiver | Control + file data |
 | 44819 | UDP | Broadcast/Unicast | Discovery |
+
+### Security model
+
+Pairing codes use challenge-response authentication, are throttled after
+repeated failures, and are not transmitted directly. Received files remain as
+`.lanxfer.part` files until sender and receiver agree on the BLAKE3 hash.
+Manifests, paths, connections, sessions, workers, browser uploads, and idle
+reads are bounded.
+
+Native TCP transfer contents are **not encrypted**. Use lanxfer on a trusted
+LAN or inside a trusted VPN when confidentiality matters. Pairing authenticates
+the operation; it does not hide filenames or file bytes from an observer on
+the network. `--open` disables pairing and should only be used deliberately.
+See [SECURITY.md](SECURITY.md) for reporting and deployment guidance.
 
 ### Firewall
 
@@ -245,7 +262,7 @@ builds archives for Windows x64, Linux x64, macOS Intel, and macOS Apple
 Silicon, then publishes them to GitHub Releases. Archive names match the
 platform identifiers used by `lanxfer update`.
 
-## Architecture (protocol v3)
+## Architecture (protocol v5)
 
 ```
 Sender                              Receiver
@@ -262,7 +279,9 @@ Sender                              Receiver
   │   [raw bytes] SendFile […] ────►│   (stripes: BLAKE3 subtree CVs,
   │   back-to-back, no acks         │    merged into whole-file hash)
   │                                 │
-  │  ◄── FileDone{id,hash} ─────────┤  on the control conn, async
+  │  ◄── FileDone{id,hash} ─────────┤  staged, not yet installed
+  │   CommitFile{id,hash} ─────────►├─ fsync + atomic/no-clobber commit
+  │  ◄── CommitAck ─────────────────┤
 ```
 
 Files ≥ 256 MiB travel as 64 MiB stripes spread across the data
@@ -271,9 +290,11 @@ connections; everything else streams whole, back-to-back.
 ## Web version
 
 `web/` contains a Next.js app (RetroUI) for browser↔browser transfers over
-WebRTC — end-to-end encrypted (DTLS), works across the internet, no server
-storage; the public PeerJS broker is used for connection setup only. Deploy
-with `vercel` from `web/`, or run locally with `bun run dev`.
+WebRTC. Transport is DTLS-encrypted and the app uses no file-storage backend;
+the public PeerJS broker is used for connection setup. Room codes are
+8 characters, incoming metadata and byte counts are validated, writes are
+serialized, and large fallback downloads are bounded. Deploy with `vercel`
+from `web/`, or run locally with `bun run dev`.
 
 ## License
 

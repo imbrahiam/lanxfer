@@ -21,7 +21,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "LANXFER — direct file transfer",
   description:
-    "Browser-to-browser encrypted file transfer over WebRTC. No accounts, no server storage.",
+    "Browser-to-browser file transfer encrypted in transit with WebRTC. No accounts or server storage.",
 };
 
 export default function RootLayout({

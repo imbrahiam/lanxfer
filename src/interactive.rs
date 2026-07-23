@@ -784,7 +784,9 @@ async fn peer_ui(
                 )
                 .await
             }
-            Action::Drives => list_drives(screen, &conn.ip, conn.port).await,
+            Action::Drives => {
+                list_drives(screen, &conn.ip, conn.port, &mut conn.auth_required, codes).await
+            }
             Action::History => print_transfers(screen, transfers),
             Action::Back => return Ok(PeerExit::Back),
             Action::Disconnect => return Ok(PeerExit::Closed),
@@ -833,8 +835,19 @@ fn ensure_code(
     Ok(Some(Some(code)))
 }
 
-async fn list_drives(screen: &mut crate::picker::StatusScreen, ip: &str, port: u16) -> Result<()> {
-    let (items, _) = fetch_destinations(ip, port).await?;
+async fn list_drives(
+    screen: &mut crate::picker::StatusScreen,
+    ip: &str,
+    port: u16,
+    auth_required: &mut bool,
+    codes: &mut HashMap<String, String>,
+) -> Result<()> {
+    let (_, needs_auth) = fetch_destinations(ip, port, None).await?;
+    let Some(code) = ensure_code(screen, ip, needs_auth, codes)? else {
+        return Ok(());
+    };
+    let (items, needs_auth) = fetch_destinations(ip, port, code.as_deref()).await?;
+    *auth_required = needs_auth;
     let details: Vec<(String, String)> = items
         .iter()
         .map(|item| {
@@ -865,9 +878,23 @@ async fn list_drives(screen: &mut crate::picker::StatusScreen, ip: &str, port: u
 
 /// Also reports whether the peer requires a pairing code — every flow
 /// learns this from its own handshake instead of guessing.
-async fn fetch_destinations(ip: &str, port: u16) -> Result<(Vec<DestinationInfo>, bool)> {
-    let (mut stream, _, auth_required) = client::connect_and_handshake(ip, port).await?;
-    send_control(&mut stream, &ControlMessage::ListDestinations).await?;
+async fn fetch_destinations(
+    ip: &str,
+    port: u16,
+    auth_code: Option<&str>,
+) -> Result<(Vec<DestinationInfo>, bool)> {
+    let (mut stream, _, auth_required, auth_challenge) =
+        client::connect_and_handshake(ip, port).await?;
+    if auth_required && auth_code.is_none() {
+        return Ok((Vec::new(), true));
+    }
+    send_control(
+        &mut stream,
+        &ControlMessage::ListDestinations {
+            auth_code: auth_code.map(|code| util::auth_proof(code, &auth_challenge)),
+        },
+    )
+    .await?;
 
     match read_control_timeout(&mut stream, REPLY_TIMEOUT).await? {
         ControlMessage::Destinations { items } => Ok((items, auth_required)),
@@ -896,13 +923,14 @@ async fn send_flow(
             (dest, code)
         }
         None => {
-            // ListDestinations needs no code; its handshake tells us whether
-            // browsing/writing will.
-            let (destinations, needs_auth) = fetch_destinations(ip, port).await?;
-            *auth_required = needs_auth;
+            // The handshake tells us whether listing/browsing/writing needs a
+            // pairing proof before any filesystem paths are disclosed.
+            let (_, needs_auth) = fetch_destinations(ip, port, None).await?;
             let Some(mut code) = ensure_code(screen, ip, needs_auth, codes)? else {
                 return Ok(());
             };
+            let (destinations, needs_auth) = fetch_destinations(ip, port, code.as_deref()).await?;
+            *auth_required = needs_auth;
             let writable: Vec<&DestinationInfo> =
                 destinations.iter().filter(|d| !d.read_only).collect();
             if writable.is_empty() {
@@ -1071,11 +1099,12 @@ async fn pick_remote_files(
     codes: &mut HashMap<String, String>,
 ) -> Result<Option<(Vec<RemoteFileSpec>, Option<String>)>> {
     // First: pick a starting drive.
-    let (destinations, needs_auth) = fetch_destinations(ip, port).await?;
-    *auth_required = needs_auth;
+    let (_, needs_auth) = fetch_destinations(ip, port, None).await?;
     let Some(mut auth_code) = ensure_code(screen, ip, needs_auth, codes)? else {
         return Ok(None);
     };
+    let (destinations, needs_auth) = fetch_destinations(ip, port, auth_code.as_deref()).await?;
+    *auth_required = needs_auth;
     let writable: Vec<&DestinationInfo> = destinations.iter().filter(|d| !d.read_only).collect();
     if writable.is_empty() {
         bail!("no drives found on remote");
@@ -1105,7 +1134,7 @@ async fn pick_remote_files(
     };
 
     let dest_root = writable[drive_idx].path.clone();
-    let mut stream = client::connect_and_handshake(ip, port).await?.0;
+    let (mut stream, _, _, auth_challenge) = client::connect_and_handshake(ip, port).await?;
     let mut current_relative = String::new();
     let mut selected_files: Vec<(String, String, u64, i64)> = Vec::new(); // (abs_path, rel_path, size, mtime)
     let mut last_idx = 0;
@@ -1116,7 +1145,9 @@ async fn pick_remote_files(
             &ControlMessage::BrowseDirectory {
                 destination_path: dest_root.clone(),
                 relative_path: current_relative.clone(),
-                auth_code: auth_code.clone(),
+                auth_code: auth_code
+                    .as_deref()
+                    .map(|code| util::auth_proof(code, &auth_challenge)),
             },
         )
         .await?;
@@ -1511,7 +1542,7 @@ async fn browse_remote_dir(
     codes: &mut HashMap<String, String>,
 ) -> Result<Option<String>> {
     // One connection for the whole browse session — no reconnect per step.
-    let (mut stream, _, _) = client::connect_and_handshake(ip, port).await?;
+    let (mut stream, _, _, auth_challenge) = client::connect_and_handshake(ip, port).await?;
     let mut current_relative = String::new();
     let mut last_idx = 0;
 
@@ -1521,7 +1552,9 @@ async fn browse_remote_dir(
             &ControlMessage::BrowseDirectory {
                 destination_path: dest_root.to_string(),
                 relative_path: current_relative.clone(),
-                auth_code: auth_code.clone(),
+                auth_code: auth_code
+                    .as_deref()
+                    .map(|code| util::auth_proof(code, &auth_challenge)),
             },
         )
         .await?;

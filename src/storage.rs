@@ -64,6 +64,9 @@ pub fn list_directory(path: &Path) -> Result<Vec<DirEntry>> {
         if name.starts_with('.') {
             continue;
         }
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         let metadata = entry.metadata()?;
         let mtime_secs = metadata
             .modified()
@@ -121,7 +124,14 @@ pub fn ensure_destination_root(path: &str) -> Result<PathBuf> {
             destination.display()
         );
     }
-    Ok(destination.to_path_buf())
+    Ok(std::fs::canonicalize(destination)?)
+}
+
+pub fn build_target_directory(destination_root: &str, relative_path: &str) -> Result<PathBuf> {
+    let root = ensure_destination_root(destination_root)?;
+    let relative = sanitize_relative_path(relative_path)?;
+    reject_symlink_components(&root, &relative)?;
+    Ok(root.join(relative))
 }
 
 pub fn build_target_paths(
@@ -130,7 +140,8 @@ pub fn build_target_paths(
 ) -> Result<(PathBuf, PathBuf)> {
     let root = ensure_destination_root(destination_root)?;
     let relative = sanitize_relative_path(relative_path)?;
-    let final_path = root.join(relative);
+    reject_symlink_components(&root, &relative)?;
+    let final_path = root.join(&relative);
 
     let file_name = final_path
         .file_name()
@@ -139,5 +150,68 @@ pub fn build_target_paths(
         .to_string();
     let part_name = format!("{file_name}.lanxfer.part");
     let part_path = final_path.with_file_name(part_name);
+    if let Ok(metadata) = std::fs::symlink_metadata(&part_path)
+        && metadata.file_type().is_symlink()
+    {
+        bail!(
+            "refusing symbolic-link transfer target: {}",
+            part_path.display()
+        );
+    }
     Ok((final_path, part_path))
+}
+
+fn reject_symlink_components(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "refusing symbolic-link transfer target: {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_paths_reject_traversal_and_duplicates_normalize() {
+        assert!(sanitize_relative_path("../escape").is_err());
+        assert_eq!(
+            sanitize_relative_path("folder/./file").unwrap(),
+            PathBuf::from("folder/file")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_builder_rejects_symlink_components() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("lanxfer-storage-{}", uuid::Uuid::new_v4().simple()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&outside)?;
+        symlink(&outside, root.join("linked"))?;
+
+        assert!(build_target_paths(root.to_str().unwrap(), "linked/file.txt").is_err());
+
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
 }

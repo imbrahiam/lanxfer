@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const DEFAULT_CONTROL_PORT: u16 = 44818;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 44819;
 // Manifests carry the whole file tree in one frame.
@@ -90,8 +90,13 @@ pub enum ControlMessage {
         version: u32,
         server: DeviceInfo,
         auth_required: bool,
+        /// Fresh per-connection challenge used to prove knowledge of the
+        /// pairing code without transmitting the code itself.
+        auth_challenge: String,
     },
-    ListDestinations,
+    ListDestinations {
+        auth_code: Option<String>,
+    },
     Destinations {
         items: Vec<DestinationInfo>,
     },
@@ -105,7 +110,7 @@ pub enum ControlMessage {
         entries: Vec<DirEntry>,
     },
 
-    // --- v3 session protocol ---
+    // --- v5 session protocol ---
     /// Whole transfer manifest in one message. Receiver creates directories,
     /// plans each file, and replies with SessionPlan.
     BeginSession {
@@ -140,11 +145,20 @@ pub enum ControlMessage {
         offset: u64,
         len: u64,
     },
-    /// Emitted on the control connection when a file is fully received,
-    /// verified-by-hash and renamed into place.
+    /// Emitted when a file is fully received and staged. The sender compares
+    /// this hash with its own and explicitly commits matching files.
     FileDone {
         id: u32,
         hash: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    CommitFile {
+        id: u32,
+        expected_hash: String,
+    },
+    CommitAck {
+        id: u32,
         ok: bool,
         error: Option<String>,
     },

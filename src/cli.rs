@@ -52,6 +52,8 @@ pub enum Command {
     Connect {
         #[arg(long)]
         target: Option<String>,
+        #[arg(long)]
+        code: Option<String>,
         #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
         discovery_port: u16,
         #[arg(long, default_value_t = 1500)]
@@ -64,6 +66,8 @@ pub enum Command {
         target: String,
         #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
         port: u16,
+        #[arg(long)]
+        code: Option<String>,
     },
     /// Send a file to a receiver.
     Send {
@@ -92,6 +96,15 @@ pub enum Command {
         /// Directory to share and receive uploads into.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+        /// Disable the private-link token. Anyone on the network can access the share.
+        #[arg(long)]
+        open: bool,
+        /// Maximum size of one browser upload, in bytes.
+        #[arg(long, default_value_t = 64 * 1024 * 1024 * 1024_u64)]
+        max_upload_bytes: u64,
+        /// Maximum number of simultaneous browser connections.
+        #[arg(long, default_value_t = 32)]
+        max_connections: usize,
     },
     /// Check for updates or install the latest GitHub release.
     Update {

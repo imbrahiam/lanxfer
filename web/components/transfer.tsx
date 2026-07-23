@@ -10,8 +10,12 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CODE_LENGTH = 8;
 const CHUNK_SIZE = 256 * 1024;
 const BUFFER_HIGH = 8 * 1024 * 1024;
+const MAX_FILE_SIZE = 64 * 1024 * 1024 * 1024;
+const MAX_BUFFERED_FILE_SIZE = 512 * 1024 * 1024;
+const MAX_RELATIVE_NAME_LENGTH = 4096;
 
 type Screen = "start" | "waiting" | "connected";
 
@@ -30,9 +34,29 @@ type ControlMsg =
   | { t: "end"; id: string };
 
 function genCode() {
-  const buf = new Uint32Array(6);
+  const buf = new Uint32Array(CODE_LENGTH);
   crypto.getRandomValues(buf);
   return Array.from(buf, (v) => CODE_CHARS[v % CODE_CHARS.length]).join("");
+}
+
+function safeRelativeName(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_RELATIVE_NAME_LENGTH) {
+    return null;
+  }
+  const normalized = value.replaceAll("\\", "/");
+  const parts = normalized.split("/");
+  if (
+    parts.some(
+      (part) =>
+        part.length === 0 ||
+        part === "." ||
+        part === ".." ||
+        part.includes("\0"),
+    )
+  ) {
+    return null;
+  }
+  return parts.join("/");
 }
 
 function fmtSize(n: number) {
@@ -82,6 +106,7 @@ export function Transfer() {
   const incomingRef = React.useRef<Incoming | null>(null);
   const saveDirRef = React.useRef<FileSystemDirectoryHandle | null>(null);
   const sendQueueRef = React.useRef<Promise<void>>(Promise.resolve());
+  const receiveQueueRef = React.useRef<Promise<void>>(Promise.resolve());
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const folderInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -90,17 +115,33 @@ export function Transfer() {
   }, []);
 
   const reset = React.useCallback((message: string) => {
+    const incoming = incomingRef.current;
+    if (incoming?.writable) {
+      void incoming.writable.abort().catch(() => {});
+    }
     connRef.current?.close();
     peerRef.current?.destroy();
     connRef.current = null;
     peerRef.current = null;
     incomingRef.current = null;
+    sendQueueRef.current = Promise.resolve();
+    receiveQueueRef.current = Promise.resolve();
+    setTxs((list) => {
+      for (const tx of list) {
+        if (tx.url) URL.revokeObjectURL(tx.url);
+      }
+      return [];
+    });
     setScreen("start");
     setStatus(message);
   }, []);
 
   const bindConnection = React.useCallback(
     (conn: DataConnection) => {
+      if (connRef.current?.open) {
+        conn.close();
+        return;
+      }
       connRef.current = conn;
       conn.on("open", () => {
         setPeerLabel(conn.peer.replace(/^lanxfer-/, ""));
@@ -109,90 +150,134 @@ export function Transfer() {
       });
       conn.on("close", () => reset("peer disconnected"));
       conn.on("error", (err) => reset(`connection error: ${err.message ?? err}`));
-      conn.on("data", async (data) => {
-        // Binary chunk of the file currently in flight.
-        if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
-          const inc = incomingRef.current;
-          if (!inc) return;
-          const buf = new Uint8Array(
-            data instanceof Uint8Array
-              ? data.slice().buffer
-              : (data as ArrayBuffer),
-          ) as Uint8Array<ArrayBuffer>;
-          inc.received += buf.byteLength;
-          if (inc.writable) {
-            await inc.writable.write(buf);
-          } else {
-            inc.chunks.push(buf);
-          }
-          // throttle re-renders — per-chunk updates make the bar flash
-          const now = performance.now();
-          if (now - inc.lastUpdate > 100) {
-            inc.lastUpdate = now;
-            updateTx(`down-${inc.id}`, { done: inc.received });
-          }
-          return;
-        }
-        const msg = data as ControlMsg;
-        if (msg.t === "start") {
-          const inc: Incoming = {
-            id: msg.id,
-            name: msg.name,
-            size: msg.size,
-            received: 0,
-            chunks: [],
-            lastUpdate: 0,
-          };
-          // Stream to the chosen folder when available (creates subfolders
-          // for relative paths); otherwise buffer for a blob download.
-          const dir = saveDirRef.current;
-          if (dir) {
-            try {
-              let d = dir;
-              const parts = msg.name.split("/");
-              for (const part of parts.slice(0, -1)) {
-                d = await d.getDirectoryHandle(part, { create: true });
+      conn.on("data", (data) => {
+        receiveQueueRef.current = receiveQueueRef.current
+          .then(async () => {
+            // Serialize event handling: EventEmitter does not await async
+            // listeners, and concurrent writes can otherwise reorder chunks.
+            if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
+              const inc = incomingRef.current;
+              if (!inc) throw new Error("received file bytes before a start message");
+              const buf = new Uint8Array(
+                data instanceof Uint8Array
+                  ? data.slice().buffer
+                  : (data as ArrayBuffer),
+              ) as Uint8Array<ArrayBuffer>;
+              if (inc.received + buf.byteLength > inc.size) {
+                if (inc.writable) await inc.writable.abort();
+                incomingRef.current = null;
+                updateTx(`down-${inc.id}`, { status: "failed" });
+                throw new Error("peer sent more bytes than declared");
               }
-              const fh = await d.getFileHandle(parts[parts.length - 1], {
-                create: true,
-              });
-              inc.writable = await fh.createWritable();
-            } catch {
-              inc.writable = undefined;
+              if (inc.writable) {
+                await inc.writable.write(buf);
+              } else {
+                inc.chunks.push(buf);
+              }
+              inc.received += buf.byteLength;
+              const now = performance.now();
+              if (now - inc.lastUpdate > 100) {
+                inc.lastUpdate = now;
+                updateTx(`down-${inc.id}`, { done: inc.received });
+              }
+              return;
             }
-          }
-          incomingRef.current = inc;
-          setTxs((list) => [
-            {
-              key: `down-${msg.id}`,
-              name: msg.name,
-              size: msg.size,
-              done: 0,
-              dir: "down",
-              status: "active",
-            },
-            ...list,
-          ]);
-        } else if (msg.t === "end") {
-          const inc = incomingRef.current;
-          if (!inc || inc.id !== msg.id) return;
-          incomingRef.current = null;
-          if (inc.writable) {
-            await inc.writable.close();
-            updateTx(`down-${inc.id}`, { status: "done", done: inc.size });
-          } else {
-            const url = URL.createObjectURL(new Blob(inc.chunks));
-            updateTx(`down-${inc.id}`, { status: "done", done: inc.size, url });
-            // auto-download
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = inc.name.replaceAll("/", "_");
-            a.hidden = true;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-          }
-        }
+
+            if (!data || typeof data !== "object" || !("t" in data)) {
+              throw new Error("peer sent an invalid control message");
+            }
+            const msg = data as ControlMsg;
+            if (msg.t === "start") {
+              if (incomingRef.current) {
+                throw new Error("peer started a second file before finishing the first");
+              }
+              const name = safeRelativeName(msg.name);
+              if (
+                !name ||
+                typeof msg.id !== "string" ||
+                msg.id.length > 128 ||
+                !Number.isSafeInteger(msg.size) ||
+                msg.size < 0 ||
+                msg.size > MAX_FILE_SIZE
+              ) {
+                throw new Error("peer sent invalid file metadata");
+              }
+              if (!saveDirRef.current && msg.size > MAX_BUFFERED_FILE_SIZE) {
+                throw new Error(
+                  "incoming file is too large for browser memory; choose a save folder first",
+                );
+              }
+              const inc: Incoming = {
+                id: msg.id,
+                name,
+                size: msg.size,
+                received: 0,
+                chunks: [],
+                lastUpdate: 0,
+              };
+              const dir = saveDirRef.current;
+              if (dir) {
+                try {
+                  let d = dir;
+                  const parts = name.split("/");
+                  for (const part of parts.slice(0, -1)) {
+                    d = await d.getDirectoryHandle(part, { create: true });
+                  }
+                  const fh = await d.getFileHandle(parts[parts.length - 1], {
+                    create: true,
+                  });
+                  inc.writable = await fh.createWritable();
+                } catch {
+                  inc.writable = undefined;
+                }
+              }
+              if (!inc.writable && inc.size > MAX_BUFFERED_FILE_SIZE) {
+                throw new Error("could not open the selected save folder");
+              }
+              incomingRef.current = inc;
+              setTxs((list) => [
+                {
+                  key: `down-${msg.id}`,
+                  name,
+                  size: msg.size,
+                  done: 0,
+                  dir: "down",
+                  status: "active",
+                },
+                ...list,
+              ]);
+            } else if (msg.t === "end") {
+              const inc = incomingRef.current;
+              if (!inc || inc.id !== msg.id || inc.received !== inc.size) {
+                if (inc?.writable) await inc.writable.abort();
+                incomingRef.current = null;
+                if (inc) updateTx(`down-${inc.id}`, { status: "failed" });
+                throw new Error("file ended before the declared size was received");
+              }
+              incomingRef.current = null;
+              if (inc.writable) {
+                await inc.writable.close();
+                updateTx(`down-${inc.id}`, { status: "done", done: inc.size });
+              } else {
+                const url = URL.createObjectURL(new Blob(inc.chunks));
+                updateTx(`down-${inc.id}`, { status: "done", done: inc.size, url });
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = inc.name.replaceAll("/", "_");
+                a.hidden = true;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+              }
+            } else {
+              throw new Error("peer sent an unsupported control message");
+            }
+          })
+          .catch((error: unknown) => {
+            reset(
+              `transfer rejected: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
       });
     },
     [reset, updateTx],
@@ -213,8 +298,11 @@ export function Transfer() {
   const join = React.useCallback(
     async (code: string) => {
       code = code.trim().toUpperCase();
-      if (code.length !== 6) {
-        setStatus("code is 6 characters");
+      if (
+        code.length !== CODE_LENGTH ||
+        Array.from(code).some((character) => !CODE_CHARS.includes(character))
+      ) {
+        setStatus(`code is ${CODE_LENGTH} characters`);
         return;
       }
       const { default: PeerCtor } = await import("peerjs");
@@ -237,10 +325,25 @@ export function Transfer() {
       if (!conn || files.length === 0) return;
       for (const { file, relPath } of files) {
         const id = crypto.randomUUID();
+        const safeName = safeRelativeName(relPath);
+        if (!safeName || file.size > MAX_FILE_SIZE) {
+          setTxs((list) => [
+            {
+              key: `up-${id}`,
+              name: relPath,
+              size: file.size,
+              done: 0,
+              dir: "up",
+              status: "failed",
+            },
+            ...list,
+          ]);
+          continue;
+        }
         setTxs((list) => [
           {
             key: `up-${id}`,
-            name: relPath,
+            name: safeName,
             size: file.size,
             done: 0,
             dir: "up",
@@ -251,7 +354,7 @@ export function Transfer() {
         // Sequential queue: the receiver assembles one incoming file at a time.
         sendQueueRef.current = sendQueueRef.current.then(async () => {
           try {
-            conn.send({ t: "start", id, name: relPath, size: file.size });
+            conn.send({ t: "start", id, name: safeName, size: file.size });
             let offset = 0;
             let lastUpdate = 0;
             while (offset < file.size) {
@@ -335,8 +438,8 @@ export function Transfer() {
             <span className="animate-pulse">_</span>
           </CardTitle>
           <p className="font-medium">
-            browser ⇄ browser file transfer · end-to-end encrypted · nothing
-            stored anywhere
+            browser ⇄ browser file transfer · WebRTC encrypted in transit ·
+            nothing stored on this site
           </p>
         </CardHeader>
       </Card>
@@ -380,8 +483,8 @@ export function Transfer() {
                 <Input
                   value={joinCode}
                   onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                  maxLength={6}
-                  placeholder="ABC123"
+                  maxLength={CODE_LENGTH}
+                  placeholder="ABCD2345"
                   autoCapitalize="characters"
                   spellCheck={false}
                   className="border-2 border-black font-mono text-lg tracking-[0.4em] uppercase"

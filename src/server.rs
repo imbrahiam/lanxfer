@@ -1,13 +1,15 @@
 use anyhow::{Result, anyhow, bail};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::client;
 use crate::discovery;
@@ -18,20 +20,84 @@ use crate::protocol::{
 use crate::storage;
 use crate::util;
 
-pub fn ensure_pairing_code(opt: Option<String>) -> String {
-    opt.unwrap_or_else(util::generate_pairing_code)
+pub fn ensure_pairing_code(opt: Option<String>) -> Result<String> {
+    let code = opt.unwrap_or_else(util::generate_pairing_code);
+    let code = code.trim().to_uppercase();
+    if code.len() < 8 {
+        bail!("custom pairing codes must be at least 8 characters");
+    }
+    if code.len() > 64 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!("pairing codes must contain 8-64 ASCII letters or digits");
+    }
+    Ok(code)
 }
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
+const MAX_CONNECTIONS: usize = 128;
+const MAX_SESSIONS: usize = 32;
+const MAX_MANIFEST_FILES: usize = 100_000;
+const MAX_MANIFEST_DIRS: usize = 100_000;
+const MAX_RELATIVE_PATH_BYTES: usize = 4096;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DATA_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_AUTH_FAILURES: u32 = 5;
+const AUTH_BLOCK_TIME: Duration = Duration::from_secs(30);
 
 /// One-time tokens registered by our own pull requests: when we ask a peer
 /// to push files back to us, the write-back BeginSession authenticates with
 /// this token instead of our pairing code (which the peer must never learn).
 pub type PullTokens = Arc<Mutex<HashSet<String>>>;
 
-fn consume_pull_token(tokens: &PullTokens, code: Option<&str>) -> bool {
-    match code {
-        Some(code) => tokens.lock().unwrap().remove(code),
+#[derive(Default)]
+struct AuthLimiter {
+    attempts: Mutex<HashMap<IpAddr, AuthAttempt>>,
+}
+
+struct AuthAttempt {
+    failures: u32,
+    blocked_until: Option<Instant>,
+}
+
+impl AuthLimiter {
+    fn is_blocked(&self, peer: IpAddr) -> Option<Duration> {
+        let mut attempts = self.attempts.lock().unwrap();
+        let attempt = attempts.get_mut(&peer)?;
+        let blocked_until = attempt.blocked_until?;
+        let remaining = blocked_until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            attempts.remove(&peer);
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn success(&self, peer: IpAddr) {
+        self.attempts.lock().unwrap().remove(&peer);
+    }
+
+    fn failure(&self, peer: IpAddr) {
+        let mut attempts = self.attempts.lock().unwrap();
+        let attempt = attempts.entry(peer).or_insert(AuthAttempt {
+            failures: 0,
+            blocked_until: None,
+        });
+        attempt.failures = attempt.failures.saturating_add(1);
+        if attempt.failures >= MAX_AUTH_FAILURES {
+            attempt.blocked_until = Some(Instant::now() + AUTH_BLOCK_TIME);
+        }
+    }
+}
+
+fn consume_pull_token(tokens: &PullTokens, proof: &str, challenge: &str) -> bool {
+    let mut tokens = tokens.lock().unwrap();
+    let matching = tokens
+        .iter()
+        .find(|token| util::constant_time_eq(proof, &util::auth_proof(token, challenge)))
+        .cloned();
+    match matching {
+        Some(token) => tokens.remove(&token),
         None => false,
     }
 }
@@ -58,7 +124,9 @@ struct FileState {
     hasher: Option<blake3::Hasher>,
     /// Striped files: per-stripe subtree chaining values.
     stripe_cvs: HashMap<u32, util::StripeCv>,
+    hash: Option<String>,
     done: bool,
+    committed: bool,
     expects_data: bool,
 }
 
@@ -80,6 +148,8 @@ pub async fn run_server(
     let local = listener.local_addr()?;
     let device = util::local_device_info();
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let auth_limiter = Arc::new(AuthLimiter::default());
+    let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     info!("server listening on {local} (auth: {require_auth})");
 
     let discovery_device = device.clone();
@@ -94,6 +164,7 @@ pub async fn run_server(
     });
 
     loop {
+        let permit = Arc::clone(&connection_limit).acquire_owned().await?;
         let (socket, peer) = listener.accept().await?;
         debug!("accepted connection from {peer}");
         let server_device = device.clone();
@@ -103,7 +174,9 @@ pub async fn run_server(
         let pull_tokens = Arc::clone(&pull_tokens);
         let recv_progress = Arc::clone(&recv_progress);
         let send_progress = Arc::clone(&send_progress);
+        let auth_limiter = Arc::clone(&auth_limiter);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = handle_client(
                 socket,
                 server_device,
@@ -114,6 +187,7 @@ pub async fn run_server(
                 pull_tokens,
                 recv_progress,
                 send_progress,
+                auth_limiter,
             )
             .await
             {
@@ -141,11 +215,16 @@ async fn handle_client(
     pull_tokens: PullTokens,
     recv_progress: Arc<crate::progress::Progress>,
     send_progress: Arc<crate::progress::Progress>,
+    auth_limiter: Arc<AuthLimiter>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     tune_socket(&stream);
 
-    let first = read_control(&mut stream).await?;
+    let peer_ip = stream.peer_addr()?.ip();
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control(&mut stream))
+        .await
+        .map_err(|_| anyhow!("handshake timed out"))??;
+    let challenge = util::auth_challenge();
     let (client_name, client_port) = match first {
         ControlMessage::Hello {
             version,
@@ -158,6 +237,7 @@ async fn handle_client(
                     version: PROTOCOL_VERSION,
                     server: server_device,
                     auth_required: require_auth,
+                    auth_challenge: challenge.clone(),
                 },
             )
             .await?;
@@ -188,9 +268,11 @@ async fn handle_client(
     };
 
     loop {
-        let msg = match read_control(&mut stream).await {
-            Ok(msg) => msg,
-            Err(_) => return Ok(()),
+        let msg = match tokio::time::timeout(CONTROL_IDLE_TIMEOUT, read_control(&mut stream)).await
+        {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(_)) => return Ok(()),
+            Err(_) => bail!("control connection idle timeout"),
         };
 
         match msg {
@@ -213,7 +295,25 @@ async fn handle_client(
                     return Ok(());
                 }
             }
-            ControlMessage::ListDestinations => {
+            ControlMessage::ListDestinations { auth_code } => {
+                if let Err(err) = authorize(
+                    auth_code.as_deref(),
+                    &pairing_code,
+                    require_auth,
+                    &challenge,
+                    peer_ip,
+                    &auth_limiter,
+                    None,
+                ) {
+                    send_control(
+                        &mut stream,
+                        &ControlMessage::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 let items = storage::list_destinations();
                 send_control(&mut stream, &ControlMessage::Destinations { items }).await?;
             }
@@ -228,6 +328,9 @@ async fn handle_client(
                     auth_code.as_deref(),
                     &pairing_code,
                     require_auth,
+                    &challenge,
+                    peer_ip,
+                    &auth_limiter,
                 );
                 send_control(&mut stream, &reply).await?;
             }
@@ -246,9 +349,15 @@ async fn handle_client(
                 );
                 // A pull we initiated authenticates with its one-time token
                 // instead of our pairing code.
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code, require_auth)
-                    && !consume_pull_token(&pull_tokens, auth_code.as_deref())
-                {
+                if let Err(err) = authorize(
+                    auth_code.as_deref(),
+                    &pairing_code,
+                    require_auth,
+                    &challenge,
+                    peer_ip,
+                    &auth_limiter,
+                    Some(&pull_tokens),
+                ) {
                     warn!("BeginSession rejected: {err}");
                     send_control(
                         &mut stream,
@@ -272,6 +381,16 @@ async fn handle_client(
                             },
                         };
                     send_control(&mut stream, &reply).await?;
+                    continue;
+                }
+                if sessions.lock().unwrap().len() >= MAX_SESSIONS {
+                    send_control(
+                        &mut stream,
+                        &ControlMessage::Error {
+                            message: "receiver is busy; too many active sessions".to_string(),
+                        },
+                    )
+                    .await?;
                     continue;
                 }
                 // Real session: this connection becomes the session's control
@@ -299,7 +418,15 @@ async fn handle_client(
                     "PushRequest from {client_name}: {} files -> {dest_local_path} (reply port {requester_port})",
                     files.len()
                 );
-                if let Err(err) = ensure_auth(auth_code.as_deref(), &pairing_code, require_auth) {
+                if let Err(err) = authorize(
+                    auth_code.as_deref(),
+                    &pairing_code,
+                    require_auth,
+                    &challenge,
+                    peer_ip,
+                    &auth_limiter,
+                    None,
+                ) {
                     warn!("PushRequest rejected: {err}");
                     send_control(
                         &mut stream,
@@ -374,14 +501,26 @@ async fn handle_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn browse_reply(
     destination_path: &str,
     relative_path: String,
     auth_code: Option<&str>,
     pairing_code: &str,
     require_auth: bool,
+    challenge: &str,
+    peer_ip: IpAddr,
+    auth_limiter: &AuthLimiter,
 ) -> ControlMessage {
-    if let Err(err) = ensure_auth(auth_code, pairing_code, require_auth) {
+    if let Err(err) = authorize(
+        auth_code,
+        pairing_code,
+        require_auth,
+        challenge,
+        peer_ip,
+        auth_limiter,
+        None,
+    ) {
         return ControlMessage::Error {
             message: err.to_string(),
         };
@@ -391,7 +530,7 @@ fn browse_reply(
         let target = if relative_path.is_empty() {
             root
         } else {
-            root.join(storage::sanitize_relative_path(&relative_path)?)
+            storage::build_target_directory(destination_path, &relative_path)?
         };
         storage::list_directory(&target)
     })();
@@ -488,6 +627,21 @@ async fn run_session_control(
                 };
                 let _ = session.out_tx.send(reply);
             }
+            Ok(ControlMessage::CommitFile { id, expected_hash }) => {
+                let reply = match commit_file(&session, id, &expected_hash).await {
+                    Ok(()) => ControlMessage::CommitAck {
+                        id,
+                        ok: true,
+                        error: None,
+                    },
+                    Err(err) => ControlMessage::CommitAck {
+                        id,
+                        ok: false,
+                        error: Some(err.to_string()),
+                    },
+                };
+                let _ = session.out_tx.send(reply);
+            }
             Ok(_) => {
                 let _ = session.out_tx.send(ControlMessage::Error {
                     message: "unexpected message on session control connection".to_string(),
@@ -512,12 +666,12 @@ async fn plan_session(
     dirs: &[DirSpec],
     dry_run: bool,
 ) -> Result<(Vec<FileAction>, HashMap<u32, FileState>)> {
+    validate_manifest(files, dirs)?;
     storage::ensure_destination_root(destination_path)?;
 
     if !dry_run {
         for dir in dirs {
-            let rel = storage::sanitize_relative_path(&dir.rel_path)?;
-            let path = PathBuf::from(destination_path).join(rel);
+            let path = storage::build_target_directory(destination_path, &dir.rel_path)?;
             fs::create_dir_all(&path).await?;
             let _ = util::set_mtime(&path, dir.mtime_secs).await;
         }
@@ -525,10 +679,14 @@ async fn plan_session(
 
     let mut actions = Vec::with_capacity(files.len());
     let mut states = HashMap::new();
+    let mut target_paths = HashSet::new();
 
     for spec in files {
         let (final_path, part_path) =
             storage::build_target_paths(destination_path, &spec.rel_path)?;
+        if !target_paths.insert(final_path.clone()) || !target_paths.insert(part_path.clone()) {
+            bail!("manifest contains colliding target path: {}", spec.rel_path);
+        }
 
         let mut state = FileState {
             size: spec.size,
@@ -539,7 +697,9 @@ async fn plan_session(
             received: 0,
             hasher: None,
             stripe_cvs: HashMap::new(),
+            hash: None,
             done: false,
+            committed: false,
             expects_data: true,
         };
 
@@ -597,6 +757,50 @@ async fn plan_session(
     Ok((actions, states))
 }
 
+fn validate_manifest(files: &[FileSpec], dirs: &[DirSpec]) -> Result<()> {
+    if files.len() > MAX_MANIFEST_FILES {
+        bail!(
+            "manifest has too many files: {} (maximum {MAX_MANIFEST_FILES})",
+            files.len()
+        );
+    }
+    if dirs.len() > MAX_MANIFEST_DIRS {
+        bail!(
+            "manifest has too many directories: {} (maximum {MAX_MANIFEST_DIRS})",
+            dirs.len()
+        );
+    }
+
+    let mut ids = HashSet::with_capacity(files.len());
+    let mut paths = HashSet::with_capacity(files.len() + dirs.len());
+    let mut total_bytes = 0u64;
+    for file in files {
+        if !ids.insert(file.id) {
+            bail!("manifest contains duplicate file id {}", file.id);
+        }
+        validate_manifest_path(&file.rel_path, &mut paths)?;
+        total_bytes = total_bytes
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow!("manifest byte total overflow"))?;
+    }
+    for dir in dirs {
+        validate_manifest_path(&dir.rel_path, &mut paths)?;
+    }
+    let _ = total_bytes;
+    Ok(())
+}
+
+fn validate_manifest_path(path: &str, seen: &mut HashSet<PathBuf>) -> Result<()> {
+    if path.len() > MAX_RELATIVE_PATH_BYTES {
+        bail!("manifest path exceeds {MAX_RELATIVE_PATH_BYTES} bytes");
+    }
+    let normalized = storage::sanitize_relative_path(path)?;
+    if !seen.insert(normalized) {
+        bail!("manifest contains duplicate path: {path}");
+    }
+    Ok(())
+}
+
 /// Prepare state for a from-scratch transfer. Plain files create their part
 /// file lazily on first write (data workers parallelize those syscalls —
 /// creating 10k parts serially at plan time dominates small-file transfers).
@@ -648,6 +852,9 @@ async fn restart_file(session: &Arc<Session>, id: u32) -> Result<()> {
         state.received = 0;
         state.hasher = Some(blake3::Hasher::new());
         state.stripe_cvs.clear();
+        state.hash = None;
+        state.done = false;
+        state.committed = false;
         state.part_path.clone()
     };
     let file = OpenOptions::new().write(true).open(&part_path).await?;
@@ -657,9 +864,10 @@ async fn restart_file(session: &Arc<Session>, id: u32) -> Result<()> {
 
 async fn run_data_conn(mut reader: BufReader<OwnedReadHalf>, session: Arc<Session>) -> Result<()> {
     loop {
-        let msg = match read_control(&mut reader).await {
-            Ok(msg) => msg,
-            Err(_) => return Ok(()), // sender closed the data connection
+        let msg = match tokio::time::timeout(DATA_IDLE_TIMEOUT, read_control(&mut reader)).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(_)) => return Ok(()), // sender closed the data connection
+            Err(_) => bail!("data connection idle timeout"),
         };
         match msg {
             ControlMessage::SendFile { id, offset, len } => {
@@ -694,7 +902,10 @@ async fn receive_unit(
         if state.done || !state.expects_data {
             bail!("unexpected data for file {id}");
         }
-        if offset + len > state.size {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("unit range overflow for file {id}"))?;
+        if end > state.size {
             bail!("unit out of bounds for file {id}");
         }
         let striped = util::is_striped(state.size);
@@ -703,6 +914,12 @@ async fn receive_unit(
                 util::stripe_range(state.size, (offset / util::STRIPE_SIZE) as u32);
             if offset != stripe_start || len != stripe_len {
                 bail!("unit is not stripe-aligned for file {id}");
+            }
+            if state
+                .stripe_cvs
+                .contains_key(&((offset / util::STRIPE_SIZE) as u32))
+            {
+                bail!("duplicate stripe for file {id}");
             }
             (
                 state.part_path.clone(),
@@ -747,9 +964,9 @@ async fn receive_unit(
     let write_result: Result<()> = async {
         while remaining > 0 {
             let to_read = usize::min(remaining as usize, buf.len());
-            reader
-                .read_exact(&mut buf[..to_read])
+            tokio::time::timeout(DATA_IDLE_TIMEOUT, reader.read_exact(&mut buf[..to_read]))
                 .await
+                .map_err(|_| anyhow!("transfer read timed out"))?
                 .map_err(|e| anyhow!("transfer read error: {e}"))?;
             hasher.update(&buf[..to_read]);
             file.write_all(&buf[..to_read]).await?;
@@ -770,7 +987,13 @@ async fn receive_unit(
         let state = files
             .get_mut(&id)
             .ok_or_else(|| anyhow!("file state vanished"))?;
-        state.received += len;
+        state.received = state
+            .received
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("received byte count overflow for file {id}"))?;
+        if state.received > state.size - state.start_offset {
+            bail!("received too much data for file {id}");
+        }
         if striped {
             state
                 .stripe_cvs
@@ -802,29 +1025,15 @@ async fn receive_unit(
                     .to_hex()
                     .to_string()
             };
-            Some((
-                hash,
-                state.part_path.clone(),
-                state.final_path.clone(),
-                state.mtime_secs,
-            ))
+            state.hash = Some(hash.clone());
+            Some(hash)
         } else {
             None
         }
     };
 
-    if let Some((hash, part_path, final_path, mtime_secs)) = finalize {
-        session.progress.file_done();
-        debug!("file {id} complete -> {}", final_path.display());
-        if session.overwrite && fs::metadata(&final_path).await.is_ok() {
-            let _ = fs::remove_file(&final_path).await;
-        }
-        fs::rename(&part_path, &final_path).await?;
-        // fire-and-forget: mtime is cosmetic metadata, not worth serializing
-        // 10k blocking waits into the completion path
-        tokio::spawn(async move {
-            let _ = util::set_mtime(&final_path, mtime_secs).await;
-        });
+    if let Some(hash) = finalize {
+        debug!("file {id} staged and awaiting hash commit");
         let _ = session.out_tx.send(ControlMessage::FileDone {
             id,
             hash,
@@ -836,23 +1045,132 @@ async fn receive_unit(
     Ok(())
 }
 
-fn ensure_auth(provided: Option<&str>, expected: &str, require_auth: bool) -> Result<()> {
+async fn commit_file(session: &Arc<Session>, id: u32, expected_hash: &str) -> Result<()> {
+    if expected_hash.len() != 64 || !expected_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid expected hash for file {id}");
+    }
+    let (part_path, final_path, mtime_secs) = {
+        let files = session.files.lock().unwrap();
+        let state = files
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown file id {id}"))?;
+        if !state.done {
+            bail!("file {id} is not fully staged");
+        }
+        if state.committed {
+            bail!("file {id} was already committed");
+        }
+        let actual = state
+            .hash
+            .as_deref()
+            .ok_or_else(|| anyhow!("file {id} has no staged hash"))?;
+        if !util::constant_time_eq(actual, expected_hash) {
+            bail!("hash mismatch for file {id}; staged data was preserved");
+        }
+        (
+            state.part_path.clone(),
+            state.final_path.clone(),
+            state.mtime_secs,
+        )
+    };
+
+    let staged = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&part_path)
+        .await?;
+    staged.sync_all().await?;
+    drop(staged);
+
+    if session.overwrite {
+        if let Err(first_err) = fs::rename(&part_path, &final_path).await {
+            if fs::metadata(&final_path).await.is_ok() {
+                fs::remove_file(&final_path).await?;
+                fs::rename(&part_path, &final_path).await?;
+            } else {
+                return Err(first_err.into());
+            }
+        }
+    } else {
+        fs::hard_link(&part_path, &final_path)
+            .await
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow!(
+                        "destination appeared during transfer: {}",
+                        final_path.display()
+                    )
+                } else {
+                    anyhow!(
+                        "could not atomically commit {}: {err}",
+                        final_path.display()
+                    )
+                }
+            })?;
+        if let Err(err) = fs::remove_file(&part_path).await {
+            warn!(
+                "committed {} but could not remove staged link {}: {err}",
+                final_path.display(),
+                part_path.display()
+            );
+        }
+    }
+    if let Err(err) = util::set_mtime(&final_path, mtime_secs).await {
+        warn!(
+            "could not preserve mtime for {}: {err}",
+            final_path.display()
+        );
+    }
+
+    let mut files = session.files.lock().unwrap();
+    let state = files
+        .get_mut(&id)
+        .ok_or_else(|| anyhow!("file state vanished"))?;
+    state.committed = true;
+    session.progress.file_done();
+    debug!("file {id} committed -> {}", final_path.display());
+    Ok(())
+}
+
+fn authorize(
+    provided: Option<&str>,
+    expected_secret: &str,
+    require_auth: bool,
+    challenge: &str,
+    peer_ip: IpAddr,
+    limiter: &AuthLimiter,
+    pull_tokens: Option<&PullTokens>,
+) -> Result<()> {
     if !require_auth {
         return Ok(());
     }
-    let value = provided.unwrap_or_default().trim();
-    if value.is_empty() {
+    if let Some(remaining) = limiter.is_blocked(peer_ip) {
+        bail!(
+            "too many invalid pairing attempts; retry in {} seconds",
+            remaining.as_secs().max(1)
+        );
+    }
+    let proof = provided.unwrap_or_default().trim();
+    if proof.is_empty() {
+        limiter.failure(peer_ip);
         bail!("pairing code is required for write operations");
     }
-    if value != expected {
-        bail!("invalid pairing code");
+    let expected = util::auth_proof(expected_secret, challenge);
+    let pairing_matches = util::constant_time_eq(proof, &expected);
+    let token_matches = pull_tokens
+        .map(|tokens| consume_pull_token(tokens, proof, challenge))
+        .unwrap_or(false);
+    if pairing_matches || token_matches {
+        limiter.success(peer_ip);
+        return Ok(());
     }
-    Ok(())
+    limiter.failure(peer_ip);
+    bail!("invalid pairing code")
 }
 
 /// Handle an incoming PushRequest: verify requested files exist locally,
 /// then act as sender — connect back to the requester's server and stream
-/// the files using the existing v3 protocol. `return_auth_code` is the
+/// the files using the existing v5 protocol. `return_auth_code` is the
 /// requester's one-time token, presented back to its server.
 #[allow(clippy::too_many_arguments)]
 async fn handle_push_request(
@@ -942,6 +1260,9 @@ async fn handle_push_request(
 mod tests {
     use super::*;
     use crate::client;
+    use crate::protocol::{FileSpec, PlanAction};
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::AsyncWriteExt;
 
     /// Full pull round-trip over localhost: requester B (auth on) registers a
     /// one-time token, remote A pushes the file back authenticating with it.
@@ -1034,6 +1355,180 @@ mod tests {
         assert!(!summary.errors.is_empty(), "pull without token must fail");
 
         let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_weak_custom_codes_and_abusive_manifests() {
+        assert!(ensure_pairing_code(Some("ABC123".into())).is_err());
+        assert_eq!(
+            ensure_pairing_code(Some(" secure42 ".into())).unwrap(),
+            "SECURE42"
+        );
+
+        let duplicate_ids = vec![
+            FileSpec {
+                id: 1,
+                rel_path: "a".into(),
+                size: 1,
+                mtime_secs: 0,
+            },
+            FileSpec {
+                id: 1,
+                rel_path: "b".into(),
+                size: 1,
+                mtime_secs: 0,
+            },
+        ];
+        assert!(validate_manifest(&duplicate_ids, &[]).is_err());
+
+        let duplicate_paths = vec![
+            FileSpec {
+                id: 1,
+                rel_path: "folder/file".into(),
+                size: 1,
+                mtime_secs: 0,
+            },
+            FileSpec {
+                id: 2,
+                rel_path: "folder/./file".into(),
+                size: 1,
+                mtime_secs: 0,
+            },
+        ];
+        assert!(validate_manifest(&duplicate_paths, &[]).is_err());
+    }
+
+    #[test]
+    fn repeated_bad_pairing_proofs_are_throttled() {
+        let limiter = AuthLimiter::default();
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        for _ in 0..MAX_AUTH_FAILURES {
+            assert!(
+                authorize(
+                    Some("bad-proof"),
+                    "SECURE42",
+                    true,
+                    "challenge",
+                    peer,
+                    &limiter,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let correct = util::auth_proof("SECURE42", "challenge");
+        let error = authorize(
+            Some(&correct),
+            "SECURE42",
+            true,
+            "challenge",
+            peer,
+            &limiter,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("too many invalid"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hash_mismatch_never_installs_staged_file() -> Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("lanxfer-commit-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&base)?;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::spawn(run_server(
+            listener,
+            0,
+            "SECURE42".into(),
+            true,
+            false,
+            None,
+            PullTokens::default(),
+            Arc::default(),
+            Arc::default(),
+        ));
+
+        let (mut control, _, _, _) = client::connect_and_handshake("127.0.0.1", port).await?;
+        send_control(
+            &mut control,
+            &ControlMessage::BeginSession {
+                destination_path: base.to_string_lossy().into_owned(),
+                auth_code: None,
+                overwrite: false,
+                dry_run: false,
+                files: vec![FileSpec {
+                    id: 0,
+                    rel_path: "staged.txt".into(),
+                    size: 3,
+                    mtime_secs: 0,
+                }],
+                dirs: vec![],
+            },
+        )
+        .await?;
+        let session_id = match read_control(&mut control).await? {
+            ControlMessage::SessionPlan {
+                session_id,
+                actions,
+            } => {
+                assert!(matches!(actions[0].action, PlanAction::Send));
+                session_id
+            }
+            other => bail!("unexpected plan: {other:?}"),
+        };
+
+        let (mut data, _, _, _) = client::connect_and_handshake("127.0.0.1", port).await?;
+        send_control(&mut data, &ControlMessage::JoinSession { session_id }).await?;
+        assert!(matches!(
+            read_control(&mut data).await?,
+            ControlMessage::JoinAck
+        ));
+        send_control(
+            &mut data,
+            &ControlMessage::SendFile {
+                id: 0,
+                offset: 0,
+                len: 3,
+            },
+        )
+        .await?;
+        data.write_all(b"bad").await?;
+        data.flush().await?;
+
+        assert!(matches!(
+            read_control(&mut control).await?,
+            ControlMessage::FileDone {
+                id: 0,
+                ok: true,
+                ..
+            }
+        ));
+        send_control(
+            &mut control,
+            &ControlMessage::CommitFile {
+                id: 0,
+                expected_hash: blake3::hash(b"not the bytes").to_hex().to_string(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_control(&mut control).await?,
+            ControlMessage::CommitAck {
+                id: 0,
+                ok: false,
+                ..
+            }
+        ));
+        assert!(!base.join("staged.txt").exists());
+        assert!(base.join("staged.txt.lanxfer.part").exists());
+
+        drop(data);
+        drop(control);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::remove_dir_all(base)?;
         Ok(())
     }
 }
